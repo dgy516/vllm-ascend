@@ -155,7 +155,7 @@ class AscendFusedMoE310(FusedMoE):
         self.quant_method.create_weights(layer=self, **moe_quant_params)
         self.quant_type = self.get_quant_type()
 
-        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl310(self.moe_config)
+        _MoECommMethods[MoECommType.ALLGATHER] = [AllGatherCommImpl310(self.moe_config)]
         self.runner = self._init_runner()
 
     def _init_runner(self):
