@@ -236,7 +236,9 @@ class AscendQwen3Next_GatedDeltaNet(Qwen3NextGatedDeltaNet):
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
 
-            initial_state[~has_initial_state, ...] = 0
+            keep_dims = (1,) * (initial_state.dim() - 1)
+            mask = (~has_initial_state).reshape(-1, *keep_dims)
+            initial_state.masked_fill_(mask, 0)
             non_spec_chunked_prefill_meta = getattr(
                 attn_metadata,
                 "non_spec_chunked_prefill_meta",
