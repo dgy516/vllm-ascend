@@ -376,6 +376,14 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_experts = self.global_num_experts
         self.moe_config.num_local_experts = self.local_num_experts
         self.moe_config.global_redundant_expert_num = self.global_redundant_expert_num
+        self.moe_config.use_grouped_topk = self.use_grouped_topk
+        self.moe_config.renormalize = self.renormalize
+        self.moe_config.topk_group = self.topk_group
+        self.moe_config.num_expert_group = self.num_expert_group
+        self.moe_config.custom_routing_function = self.custom_routing_function
+        self.moe_config.scoring_func = self.scoring_func
+        self.moe_config.routed_scaling_factor = self.routed_scaling_factor
+        self.moe_config.e_score_correction_bias = self.e_score_correction_bias
 
         moe_quant_params = {
             "num_experts": self.local_num_experts,

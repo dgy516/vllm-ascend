@@ -189,7 +189,13 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
-        if zero_expert_num == 0 or zero_expert_type is None:
+        precomputed_topk_weights = getattr(_EXTRA_CTX, "moe_tp_topk_weights", None)
+        precomputed_topk_ids = getattr(_EXTRA_CTX, "moe_tp_topk_ids", None)
+        if precomputed_topk_weights is not None or precomputed_topk_ids is not None:
+            assert precomputed_topk_weights is not None and precomputed_topk_ids is not None, (
+                "MoE-TP precomputed routing metadata must include both topk_weights and topk_ids."
+            )
+        if (zero_expert_num == 0 or zero_expert_type is None) and precomputed_topk_weights is None:
             assert router_logits.shape[1] == global_num_experts - global_redundant_expert_num, (
                 "Number of global experts mismatch (excluding redundancy)"
             )
@@ -199,6 +205,11 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             assert fc3_context is not None
             topk_weights = fc3_context.topk_weights
             topk_ids = fc3_context.topk_ids
+        elif precomputed_topk_weights is not None:
+            topk_weights = precomputed_topk_weights
+            topk_ids = precomputed_topk_ids
+            _EXTRA_CTX.moe_tp_topk_weights = None
+            _EXTRA_CTX.moe_tp_topk_ids = None
         else:
             if (
                 _EXTRA_CTX.moe_comm_type == MoECommType.MOE_TP_ALLGATHER

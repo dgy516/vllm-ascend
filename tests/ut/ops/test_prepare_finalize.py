@@ -313,13 +313,22 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.assertTrue(torch.equal(result, expected_global_hidden[3:5] + 5))
 
     @patch("torch_npu.npu_dynamic_quant")
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.select_experts")
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize._EXTRA_CTX")
-    def test_moe_tp_prepare_finalize_w8a8_quantizes_before_communication(self, mock_extra_ctx, mock_dynamic_quant):
+    def test_moe_tp_prepare_finalize_w8a8_quantizes_before_communication(
+        self,
+        mock_extra_ctx,
+        mock_select_experts,
+        mock_dynamic_quant,
+    ):
         mock_extra_ctx.max_tokens_across_dp = 4
 
         quant_hidden_states = torch.full((3, 2), 5, dtype=torch.int8)
         quant_scales = torch.full((3,), 0.25, dtype=torch.float32)
         mock_dynamic_quant.return_value = (quant_hidden_states, quant_scales)
+        local_topk_weights = torch.full((3, 2), 0.5, dtype=torch.float32)
+        local_topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int64)
+        mock_select_experts.return_value = (local_topk_weights, local_topk_ids)
 
         self.moe_config.moe_source_group.world_size = 2
         self.moe_config.moe_source_group_world_size = 2
@@ -344,6 +353,9 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.assertEqual(prepare_output.hidden_states.dtype, torch.int8)
         self.assertEqual(prepare_output.hidden_states.shape, torch.Size([8, 2]))
         self.assertEqual(prepare_output.pertoken_scale.shape, torch.Size([8]))
+        self.assertEqual(prepare_output.router_logits.shape, torch.Size([0, 4]))
+        self.assertEqual(mock_extra_ctx.moe_tp_topk_weights.shape, torch.Size([8, 2]))
+        self.assertEqual(mock_extra_ctx.moe_tp_topk_ids.shape, torch.Size([8, 2]))
 
     @patch("torch_npu.npu_dynamic_quant")
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize._EXTRA_CTX")
@@ -357,6 +369,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.moe_config.moe_source_group = None
         self.moe_config.moe_source_group_world_size = 2
         self.moe_config.moe_source_group_index = 1
+        self.moe_config.custom_routing_function = object()
         self.moe_config.moe_peer_group.rank_in_group = 1
 
         def mock_peer_broadcast(tensor, src):

@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
+from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch, prefill_context_parallel_enable
@@ -520,6 +521,12 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
         self.num_tokens = hidden_states.shape[0]
         self.max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp or self.num_tokens
         self.is_source_rank = self.moe_peer_group.rank_in_group == self.source_tp_rank
+        should_precompute_routing = (
+            quant_type == QuantType.W8A8
+            and getattr(self.moe_config, "custom_routing_function", None) is None
+        )
+        _EXTRA_CTX.moe_tp_topk_weights = None
+        _EXTRA_CTX.moe_tp_topk_ids = None
         if self.is_source_rank:
             assert self.moe_source_group is not None, "source ranks must initialize moe_source_group."
         global_num_tokens = self.max_tokens_across_dp * self.moe_source_group_world_size
@@ -528,6 +535,21 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
         hidden_size = hidden_states.shape[-1]
 
         if self.is_source_rank:
+            if should_precompute_routing:
+                local_topk_weights, local_topk_ids = select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    top_k=self.moe_config.experts_per_token,
+                    use_grouped_topk=getattr(self.moe_config, "use_grouped_topk", False),
+                    renormalize=getattr(self.moe_config, "renormalize", False),
+                    topk_group=getattr(self.moe_config, "topk_group", None),
+                    num_expert_group=getattr(self.moe_config, "num_expert_group", None),
+                    custom_routing_function=None,
+                    scoring_func=getattr(self.moe_config, "scoring_func", "softmax"),
+                    routed_scaling_factor=getattr(self.moe_config, "routed_scaling_factor", 1.0),
+                    e_score_correction_bias=getattr(self.moe_config, "e_score_correction_bias", None),
+                    global_num_experts=self.moe_config.num_experts,
+                )
             if quant_type == QuantType.W8A8:
                 # Only the source TP rank owns the canonical MoE inputs. Quantize
                 # there before communication so peers do not pay duplicate work.
@@ -538,9 +560,17 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
                 router_logits = self._pad_along_first_dim(router_logits, pad_size)
                 if pertoken_scale is not None:
                     pertoken_scale = self._pad_along_first_dim(pertoken_scale, pad_size)
+                if should_precompute_routing:
+                    local_topk_weights = self._pad_along_first_dim(local_topk_weights, pad_size)
+                    local_topk_ids = self._pad_along_first_dim(local_topk_ids, pad_size)
 
             hidden_states = self.moe_source_group.all_gather(hidden_states, 0)
-            router_logits = self.moe_source_group.all_gather(router_logits, 0)
+            if should_precompute_routing:
+                _EXTRA_CTX.moe_tp_topk_weights = self.moe_source_group.all_gather(local_topk_weights, 0)
+                _EXTRA_CTX.moe_tp_topk_ids = self.moe_source_group.all_gather(local_topk_ids, 0)
+                router_logits = router_logits.new_empty((0, router_logits.shape[-1]))
+            else:
+                router_logits = self.moe_source_group.all_gather(router_logits, 0)
             if pertoken_scale is not None:
                 pertoken_scale = self.moe_source_group.all_gather(pertoken_scale, 0)
         else:
@@ -552,11 +582,33 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
             router_logits = router_logits.new_empty((global_num_tokens, router_logits.shape[-1]))
             if quant_type == QuantType.W8A8:
                 pertoken_scale = torch.empty((global_num_tokens,), device=hidden_states.device, dtype=torch.float32)
+            if should_precompute_routing:
+                _EXTRA_CTX.moe_tp_topk_weights = torch.empty(
+                    (global_num_tokens, self.moe_config.experts_per_token),
+                    device=hidden_states.device,
+                    dtype=torch.float32,
+                )
+                _EXTRA_CTX.moe_tp_topk_ids = torch.empty(
+                    (global_num_tokens, self.moe_config.experts_per_token),
+                    device=hidden_states.device,
+                    dtype=torch.int64,
+                )
+                router_logits = router_logits.new_empty((0, router_logits.shape[-1]))
 
         hidden_states = self.moe_peer_group.broadcast(hidden_states, src=self.source_tp_rank)
-        router_logits = self.moe_peer_group.broadcast(router_logits, src=self.source_tp_rank)
+        if router_logits.numel() > 0:
+            router_logits = self.moe_peer_group.broadcast(router_logits, src=self.source_tp_rank)
         if pertoken_scale is not None:
             pertoken_scale = self.moe_peer_group.broadcast(pertoken_scale, src=self.source_tp_rank)
+        if _EXTRA_CTX.moe_tp_topk_weights is not None:
+            _EXTRA_CTX.moe_tp_topk_weights = self.moe_peer_group.broadcast(
+                _EXTRA_CTX.moe_tp_topk_weights,
+                src=self.source_tp_rank,
+            )
+            _EXTRA_CTX.moe_tp_topk_ids = self.moe_peer_group.broadcast(
+                _EXTRA_CTX.moe_tp_topk_ids,
+                src=self.source_tp_rank,
+            )
 
         return MoEPrepareOutput(
             hidden_states=hidden_states,
