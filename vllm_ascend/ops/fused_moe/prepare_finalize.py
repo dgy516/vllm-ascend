@@ -574,6 +574,26 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
     ) -> torch.Tensor:
         del reduce_results, padded_hidden_states_shape
 
+        peer_world_size = self.moe_peer_group.world_size
+        if self.max_tokens_across_dp % peer_world_size == 0:
+            # Reorder tokens from [source_group, local_batch] into
+            # [source_group, tp_peer, local_batch_shard] so reduce_scatter on
+            # the MoE-TP group returns the local shard each TP peer needs.
+            hidden_size = hidden_states.shape[-1]
+            tokens_per_peer = self.max_tokens_across_dp // peer_world_size
+            hidden_states = hidden_states.view(self.moe_source_group_world_size, self.max_tokens_across_dp, hidden_size)
+            hidden_states = hidden_states.view(
+                self.moe_source_group_world_size,
+                peer_world_size,
+                tokens_per_peer,
+                hidden_size,
+            )
+            hidden_states = hidden_states.reshape(-1, hidden_size)
+            hidden_states = self.moe_tp_group.reduce_scatter(hidden_states, dim=0)
+            hidden_states = self.moe_peer_group.all_gather(hidden_states, 0)
+            hidden_states = hidden_states[: self.num_tokens]
+            return hidden_states
+
         hidden_states = self.moe_tp_group.all_reduce(hidden_states)
         local_batch_offset = self.moe_source_group_index * self.max_tokens_across_dp
         hidden_states = hidden_states[local_batch_offset : local_batch_offset + self.num_tokens]
