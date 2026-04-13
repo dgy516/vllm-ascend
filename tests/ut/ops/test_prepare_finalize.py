@@ -260,17 +260,13 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.moe_config.moe_source_group.rank_in_group = 1
         self.moe_config.moe_source_group_index = 1
         self.moe_config.moe_peer_group.rank_in_group = 0
-        self.moe_config.moe_peer_group.world_size = 2
 
         def mock_source_all_gather(tensor, dim):
             return torch.cat([tensor, tensor + 10], dim=dim)
 
         self.moe_config.moe_source_group.all_gather = mock_source_all_gather
         self.moe_config.moe_peer_group.broadcast = lambda tensor, src: tensor
-        local_peer_shard = torch.tensor([[110.0, 111.0], [112.0, 113.0]])
-        mate_peer_shard = torch.tensor([[114.0, 115.0], [0.0, 0.0]])
-        self.moe_config.moe_tp_group.reduce_scatter = lambda tensor, dim: local_peer_shard
-        self.moe_config.moe_peer_group.all_gather = lambda tensor, dim: torch.cat([tensor, mate_peer_shard], dim=dim)
+        self.moe_config.moe_tp_group.all_reduce = lambda tensor: tensor + 100
 
         layer = PrepareAndFinalizeWithMoETPAllGather(self.moe_config)
         hidden_states = torch.arange(6, dtype=torch.float32).view(3, 2)
@@ -294,7 +290,6 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.moe_config.moe_source_group_world_size = 2
         self.moe_config.moe_source_group_index = 1
         self.moe_config.moe_peer_group.rank_in_group = 1
-        self.moe_config.moe_peer_group.world_size = 2
 
         def mock_peer_broadcast(tensor, src):
             if tuple(tensor.shape) == (6, 2):
@@ -304,8 +299,6 @@ class TestPrepareAndFinalize(unittest.TestCase):
             return tensor
 
         self.moe_config.moe_peer_group.broadcast = mock_peer_broadcast
-        self.moe_config.moe_tp_group.reduce_scatter = MagicMock(side_effect=AssertionError("fallback path should skip reduce_scatter"))
-        self.moe_config.moe_peer_group.all_gather = MagicMock(side_effect=AssertionError("fallback path should skip peer all_gather"))
         self.moe_config.moe_tp_group.all_reduce = lambda tensor: tensor + 5
 
         layer = PrepareAndFinalizeWithMoETPAllGather(self.moe_config)
