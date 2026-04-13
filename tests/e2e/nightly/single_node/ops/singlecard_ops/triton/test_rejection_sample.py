@@ -1,12 +1,13 @@
 import gc
 import pytest
 import torch
+from vllm.triton_utils import triton
 from vllm.v1.sample.rejection_sampler import \
     rejection_random_sample_kernel as original_rejection_random_sample_kernel
 
 from vllm_ascend.ops.triton.reject_sample import (
     cal_grid_and_block_size, rejection_random_sample_block_verify_kernel,
-    rejection_random_sample_kernel)
+    rejection_random_sample_kernel, sample_recovered_tokens_kernel)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.sample.rejection_sampler import \
     rejection_random_sample_block_verify_pytorch
@@ -97,6 +98,217 @@ def test_rejection_random_sample(max_spec_len, vocab_size, batch_size):
                                              BLOCK_SIZE=block_size)
     torch.npu.synchronize()
     assert torch.equal(original_output_token_ids, output_token_ids)
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+
+
+@torch.inference_mode()
+def test_rejection_random_sample_invalid_draft_tokens():
+    device = "npu"
+    batch_size = 2
+    max_spec_len = 2
+    vocab_size = 5
+
+    output_token_ids = torch.full((batch_size, max_spec_len + 1),
+                                  -1,
+                                  dtype=torch.int64,
+                                  device=device)
+    cu_num_draft_tokens = torch.tensor([2, 4], dtype=torch.int32, device=device)
+    draft_token_ids = torch.tensor([1, -1, 2, 7],
+                                   dtype=torch.int64,
+                                   device=device)
+    target_probs = torch.tensor([
+        [0.1, 0.9, 0.0, 0.0, 0.0],
+        [0.3, 0.2, 0.1, 0.4, 0.0],
+        [0.0, 0.0, 0.9, 0.1, 0.0],
+        [0.6, 0.1, 0.2, 0.1, 0.0],
+    ],
+                                dtype=torch.float32,
+                                device=device)
+    bonus_token_ids = torch.tensor([4, 4], dtype=torch.int64, device=device)
+    recovered_ids = torch.tensor([4, 3, 1, 0], dtype=torch.int64, device=device)
+    uniform_probs = torch.tensor([0.5, 0.1, 0.2, 0.1],
+                                 dtype=torch.float32,
+                                 device=device)
+    is_greedy = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    grid, block_size = cal_grid_and_block_size(batch_size)
+    rejection_random_sample_kernel[(grid, )](
+        output_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        None,
+        target_probs,
+        bonus_token_ids,
+        recovered_ids,
+        uniform_probs,
+        is_greedy,
+        max_spec_len,
+        vocab_size,
+        batch_size,
+        NO_DRAFT_PROBS=True,
+        BLOCK_SIZE=block_size)
+    torch.npu.synchronize()
+
+    expected = torch.tensor([[1, 3, -1], [2, 0, -1]],
+                            dtype=torch.int64,
+                            device=device)
+    assert torch.equal(output_token_ids, expected)
+
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+
+
+@torch.inference_mode()
+def test_sample_recovered_tokens_invalid_draft_tokens_ngram():
+    device = "npu"
+    output_token_ids = torch.empty(2, dtype=torch.int64, device=device)
+    cu_num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+    draft_token_ids = torch.tensor([1, -1], dtype=torch.int64, device=device)
+    target_probs = torch.tensor([
+        [0.1, 0.2, 0.7],
+        [0.6, 0.1, 0.3],
+    ],
+                                dtype=torch.float32,
+                                device=device)
+    q = torch.ones((1, 3), dtype=torch.float32, device=device)
+
+    sample_recovered_tokens_kernel[(1, 2)](
+        output_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        None,
+        target_probs,
+        q,
+        3,
+        triton.next_power_of_2(3),
+        NO_DRAFT_PROBS=True,
+        SUB_BLOCK=4)
+    torch.npu.synchronize()
+
+    expected = torch.tensor([2, 0], dtype=torch.int64, device=device)
+    assert torch.equal(output_token_ids, expected)
+
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+
+
+@torch.inference_mode()
+def test_rejection_random_sample_invalid_draft_tokens_with_probs():
+    device = "npu"
+    batch_size = 1
+    max_spec_len = 2
+    vocab_size = 5
+
+    output_token_ids = torch.full((batch_size, max_spec_len + 1),
+                                  -1,
+                                  dtype=torch.int64,
+                                  device=device)
+    cu_num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+    draft_token_ids = torch.tensor([1, 7], dtype=torch.int64, device=device)
+    draft_probs = torch.tensor([
+        [0.1, 0.6, 0.1, 0.1, 0.1],
+        [0.2, 0.2, 0.2, 0.2, 0.2],
+    ],
+                               dtype=torch.float32,
+                               device=device)
+    target_probs = torch.tensor([
+        [0.0, 0.9, 0.1, 0.0, 0.0],
+        [0.3, 0.1, 0.2, 0.2, 0.2],
+    ],
+                                dtype=torch.float32,
+                                device=device)
+    bonus_token_ids = torch.tensor([4], dtype=torch.int64, device=device)
+    recovered_ids = torch.tensor([3, 4], dtype=torch.int64, device=device)
+    uniform_probs = torch.tensor([0.5, 0.1],
+                                 dtype=torch.float32,
+                                 device=device)
+    is_greedy = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    grid, block_size = cal_grid_and_block_size(batch_size)
+    rejection_random_sample_kernel[(grid, )](
+        output_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        draft_probs,
+        target_probs,
+        bonus_token_ids,
+        recovered_ids,
+        uniform_probs,
+        is_greedy,
+        max_spec_len,
+        vocab_size,
+        batch_size,
+        NO_DRAFT_PROBS=False,
+        BLOCK_SIZE=block_size)
+    torch.npu.synchronize()
+
+    expected = torch.tensor([[1, 4, -1]], dtype=torch.int64, device=device)
+    assert torch.equal(output_token_ids, expected)
+
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+
+
+@torch.inference_mode()
+def test_rejection_random_sample_block_verify_invalid_draft_tokens_with_probs():
+    device = "npu"
+    batch_size = 1
+    max_spec_len = 3
+    vocab_size = 5
+
+    output_token_ids = torch.full((batch_size, max_spec_len + 1),
+                                  -1,
+                                  dtype=torch.int64,
+                                  device=device)
+    cu_num_draft_tokens = torch.tensor([3], dtype=torch.int32, device=device)
+    draft_token_ids = torch.tensor([1, 2, 7], dtype=torch.int64, device=device)
+    draft_probs = torch.tensor([
+        [0.1, 0.4, 0.1, 0.2, 0.2],
+        [0.2, 0.1, 0.5, 0.1, 0.1],
+        [0.2, 0.2, 0.2, 0.2, 0.2],
+    ],
+                               dtype=torch.float32,
+                               device=device)
+    target_probs = torch.tensor([
+        [0.0, 0.8, 0.1, 0.0, 0.1],
+        [0.1, 0.1, 0.5, 0.1, 0.2],
+        [0.4, 0.1, 0.2, 0.1, 0.2],
+    ],
+                                dtype=torch.float32,
+                                device=device)
+    bonus_token_ids = torch.tensor([4], dtype=torch.int64, device=device)
+    recovered_ids = torch.tensor([3, 0, 4], dtype=torch.int64, device=device)
+    uniform_probs = torch.tensor([0.5, 0.5, 0.1],
+                                 dtype=torch.float32,
+                                 device=device)
+    is_greedy = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    grid, block_size = cal_grid_and_block_size(batch_size)
+    rejection_random_sample_block_verify_kernel[(grid, )](
+        output_token_ids_ptr=output_token_ids,
+        cu_num_draft_tokens_ptr=cu_num_draft_tokens,
+        draft_token_ids_ptr=draft_token_ids,
+        draft_probs_ptr=draft_probs,
+        target_probs_ptr=target_probs,
+        bonus_token_ids_ptr=bonus_token_ids,
+        recovered_token_ids_ptr=recovered_ids,
+        uniform_probs_ptr=uniform_probs,
+        is_greedy_ptr=is_greedy,
+        max_spec_len=max_spec_len,
+        vocab_size=vocab_size,
+        vec_len=batch_size,
+        NO_DRAFT_PROBS=False,
+        BLOCK_SIZE=block_size)
+    torch.npu.synchronize()
+
+    expected = torch.tensor([[1, 2, 4, -1]], dtype=torch.int64, device=device)
+    assert torch.equal(output_token_ids, expected)
+
     gc.collect()
     torch.npu.empty_cache()
     torch.npu.reset_peak_memory_stats()
