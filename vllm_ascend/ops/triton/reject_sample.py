@@ -426,33 +426,34 @@ def rejection_random_sample_block_verify_kernel(
             num_draft_tokens = get_element(n_num_draft_tokens, (req_i,))
 
             for pos in range(num_draft_tokens):
-                draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-                draft_token_id_valid = (draft_token_id >= 0) & (draft_token_id < vocab_size)
-                safe_draft_token_id = tl.where(draft_token_id_valid, draft_token_id, 0)
-                target_prob = tl.load(
-                    target_probs_ptr + (start_idx + pos) * vocab_size + safe_draft_token_id,
-                    mask=draft_token_id_valid,
-                    other=0.0,
-                )
-                tmp_uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
-                uniform_prob = uniform_prob * tmp_uniform_prob
-
-                if NO_DRAFT_PROBS:
-                    draft_prob = tl.where(draft_token_id_valid, 1.0, 0.0)
-                else:
-                    draft_prob = tl.load(
-                        draft_probs_ptr + (start_idx + pos) * vocab_size + safe_draft_token_id,
+                if not rejected:
+                    draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
+                    draft_token_id_valid = (draft_token_id >= 0) & (draft_token_id < vocab_size)
+                    safe_draft_token_id = tl.where(draft_token_id_valid, draft_token_id, 0)
+                    target_prob = tl.load(
+                        target_probs_ptr + (start_idx + pos) * vocab_size + safe_draft_token_id,
                         mask=draft_token_id_valid,
                         other=0.0,
                     )
+                    tmp_uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
+                    uniform_prob = uniform_prob * tmp_uniform_prob
 
-                if draft_prob > 0:
-                    pi = min(pi * target_prob / draft_prob, 1.0)
-                if draft_prob > 0 and pi >= uniform_prob:
-                    last_accepted_token_pos = pos
-                    rejected = False
-                else:
-                    rejected = True
+                    if NO_DRAFT_PROBS:
+                        draft_prob = tl.where(draft_token_id_valid, 1.0, 0.0)
+                    else:
+                        draft_prob = tl.load(
+                            draft_probs_ptr + (start_idx + pos) * vocab_size + safe_draft_token_id,
+                            mask=draft_token_id_valid,
+                            other=0.0,
+                        )
+
+                    if draft_prob > 0:
+                        pi = min(pi * target_prob / draft_prob, 1.0)
+                    if draft_prob > 0 and pi >= uniform_prob:
+                        last_accepted_token_pos = pos
+                        rejected = False
+                    else:
+                        rejected = True
 
             if last_accepted_token_pos > -1:
                 for pos in range(last_accepted_token_pos + 1):
