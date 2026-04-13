@@ -72,7 +72,7 @@ class TestAscendFusedMoEMoeTP(TestBase):
     @patch("vllm_ascend.ops.fused_moe.fused_moe.get_tp_group")
     @patch("vllm_ascend.ops.fused_moe.fused_moe.get_ascend_config")
     @patch("vllm_ascend.ops.fused_moe.fused_moe.FusedMoE.__init__", new=_fake_fused_moe_init)
-    def test_init_wires_moe_tp_groups(
+    def test_init_wires_moe_tp_groups_for_peer_rank(
         self,
         mock_get_ascend_config,
         mock_get_tp_group,
@@ -95,6 +95,8 @@ class TestAscendFusedMoEMoeTP(TestBase):
         moe_tp_group = MagicMock()
         moe_source_group = MagicMock()
         moe_peer_group = MagicMock()
+        tp_group.rank_in_group = 1
+        moe_peer_group.rank_in_group = 1
 
         mock_get_tp_group.return_value = tp_group
         mock_get_dp_group.return_value = dp_group
@@ -127,7 +129,9 @@ class TestAscendFusedMoEMoeTP(TestBase):
         self.assertIs(moe.moe_config.ep_group, ep_group)
         self.assertIs(moe.moe_config.mc2_group, mc2_group)
         self.assertIs(moe.moe_config.moe_tp_group, moe_tp_group)
-        self.assertIs(moe.moe_config.moe_source_group, moe_source_group)
         self.assertIs(moe.moe_config.moe_peer_group, moe_peer_group)
+        self.assertIsNone(moe.moe_config.moe_source_group)
+        self.assertEqual(moe.moe_config.moe_source_group_world_size, 4)
         self.assertEqual(moe.moe_config.source_tp_rank, 0)
+        mock_get_moe_source_group.assert_not_called()
         mock_setup_moe_comm_method.assert_called_once_with(moe.moe_config)

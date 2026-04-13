@@ -323,8 +323,14 @@ class AscendFusedMoE(FusedMoE):
         if self.moe_tp_mode:
             self.moe_config.source_tp_rank = moe_parallel_config.source_tp_rank
             self.moe_config.moe_tp_group = get_moe_tp_group()
-            self.moe_config.moe_source_group = get_moe_source_group()
             self.moe_config.moe_peer_group = get_moe_peer_group()
+            self.moe_config.moe_source_group_world_size = (
+                self.moe_parallel_config.dp_size * self.moe_parallel_config.pcp_size
+            )
+            if self.moe_config.moe_peer_group.rank_in_group == moe_parallel_config.source_tp_rank:
+                self.moe_config.moe_source_group = get_moe_source_group()
+            else:
+                self.moe_config.moe_source_group = None
         # flashcommon3 gate stream
         self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
         if self.multistream_overlap_gate and AscendFusedMoE.gate_stream is None:

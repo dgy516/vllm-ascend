@@ -495,11 +495,12 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
         self.source_tp_rank = getattr(moe_config, "source_tp_rank", 0)
         self.moe_tp_group = getattr(moe_config, "moe_tp_group", None)
         self.moe_source_group = getattr(moe_config, "moe_source_group", None)
+        self.moe_source_group_world_size = getattr(moe_config, "moe_source_group_world_size", None)
         self.moe_peer_group = getattr(moe_config, "moe_peer_group", None)
 
         assert self.moe_tp_group is not None, "moe_tp_group is required for MoE-TP mode."
-        assert self.moe_source_group is not None, "moe_source_group is required for MoE-TP mode."
         assert self.moe_peer_group is not None, "moe_peer_group is required for MoE-TP mode."
+        assert self.moe_source_group_world_size is not None, "moe_source_group_world_size is required for MoE-TP mode."
 
     def prepare(
         self,
@@ -517,7 +518,9 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
         self.num_tokens = hidden_states.shape[0]
         self.max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp or self.num_tokens
         self.is_source_rank = self.moe_peer_group.rank_in_group == self.source_tp_rank
-        global_num_tokens = self.max_tokens_across_dp * self.moe_source_group.world_size
+        if self.is_source_rank:
+            assert self.moe_source_group is not None, "source ranks must initialize moe_source_group."
+        global_num_tokens = self.max_tokens_across_dp * self.moe_source_group_world_size
         pertoken_scale = None
         hidden_states_dtype = hidden_states.dtype
         hidden_size = hidden_states.shape[-1]

@@ -114,12 +114,16 @@ def init_ascend_model_parallel(
         moe_source_group_ranks = [x.tolist() for x in moe_source_group_ranks]
 
         global _MOE_SOURCE
-        _MOE_SOURCE = init_model_parallel_group(
-            moe_source_group_ranks,
-            get_world_group().local_rank,
-            backend,
-            group_name="moe_source",
-        )
+        world_rank = get_world_group().rank
+        if any(world_rank in ranks for ranks in moe_source_group_ranks):
+            _MOE_SOURCE = init_model_parallel_group(
+                moe_source_group_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name="moe_source",
+            )
+        else:
+            _MOE_SOURCE = None
 
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB

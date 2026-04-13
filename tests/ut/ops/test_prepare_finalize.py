@@ -27,6 +27,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.moe_config.dp_group = MagicMock()
         self.moe_config.moe_tp_group = MagicMock()
         self.moe_config.moe_source_group = MagicMock()
+        self.moe_config.moe_source_group_world_size = 1
         self.moe_config.moe_peer_group = MagicMock()
         self.moe_config.source_tp_rank = 0
         self.moe_config.original_num_experts = 8
@@ -254,6 +255,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         mock_extra_ctx.max_tokens_across_dp = 4
 
         self.moe_config.moe_source_group.world_size = 2
+        self.moe_config.moe_source_group_world_size = 2
         self.moe_config.moe_source_group.rank_in_group = 1
         self.moe_config.moe_peer_group.rank_in_group = 0
 
@@ -283,8 +285,8 @@ class TestPrepareAndFinalize(unittest.TestCase):
         expected_global_router = torch.full((6, 4), 11.0)
         expected_local_hidden = torch.full((2, 2), 23.0)
 
-        self.moe_config.moe_source_group.world_size = 2
-        self.moe_config.moe_source_group.rank_in_group = 0
+        self.moe_config.moe_source_group = None
+        self.moe_config.moe_source_group_world_size = 2
         self.moe_config.moe_peer_group.rank_in_group = 1
 
         def mock_peer_broadcast(tensor, src):
@@ -320,6 +322,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         mock_dynamic_quant.return_value = (quant_hidden_states, quant_scales)
 
         self.moe_config.moe_source_group.world_size = 2
+        self.moe_config.moe_source_group_world_size = 2
         self.moe_config.moe_source_group.rank_in_group = 0
         self.moe_config.moe_peer_group.rank_in_group = 0
 
@@ -350,8 +353,8 @@ class TestPrepareAndFinalize(unittest.TestCase):
         expected_global_router = torch.full((6, 4), 11.0)
         expected_global_scale = torch.full((6,), 0.125, dtype=torch.float32)
 
-        self.moe_config.moe_source_group.world_size = 2
-        self.moe_config.moe_source_group.rank_in_group = 0
+        self.moe_config.moe_source_group = None
+        self.moe_config.moe_source_group_world_size = 2
         self.moe_config.moe_peer_group.rank_in_group = 1
 
         def mock_peer_broadcast(tensor, src):
