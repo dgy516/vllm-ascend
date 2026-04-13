@@ -274,3 +274,47 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
         fused_experts_input = mock_comm.fused_experts.call_args.kwargs["fused_experts_input"]
         self.assertIs(fused_experts_input.topk_weights, topk_weights)
         self.assertIs(fused_experts_input.topk_ids, topk_ids)
+
+    @patch("vllm_ascend.quantization.methods.w8a8_dynamic._EXTRA_CTX")
+    def test_apply_rejects_custom_routing_on_prequantized_moe_tp(self, mock_extra_ctx):
+        tokens = 4
+        hidden_size = self.hidden_size
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.randint(
+            -8,
+            8,
+            (self.num_experts, 2 * self.intermediate_size, hidden_size),
+            dtype=torch.int8,
+        )
+        layer.w2_weight = torch.randint(
+            -8,
+            8,
+            (self.num_experts, hidden_size, self.intermediate_size),
+            dtype=torch.int8,
+        )
+        layer.w13_weight_scale_fp32 = torch.ones(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32)
+        layer.w2_weight_scale = torch.ones(self.num_experts, hidden_size, dtype=torch.float32)
+
+        x = torch.randint(-8, 8, (tokens, hidden_size), dtype=torch.int8)
+        router_logits = torch.randn(tokens, self.num_experts, dtype=torch.float32)
+        pertoken_scale = torch.ones(tokens, dtype=torch.float32)
+
+        mock_extra_ctx.moe_comm_method = Mock()
+        mock_extra_ctx.moe_comm_type = MoECommType.MOE_TP_ALLGATHER
+        self.quant_method.multistream_overlap_gate = False
+        self.quant_method.in_dtype = torch.float32
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "MoE-TP W8A8 pre-quantized routing does not support custom_routing_function.",
+        ):
+            self.quant_method.apply(
+                layer=layer,
+                x=x,
+                router_logits=router_logits,
+                top_k=2,
+                renormalize=True,
+                global_num_experts=self.num_experts,
+                custom_routing_function=lambda **kwargs: kwargs,
+                pertoken_scale=pertoken_scale,
+            )

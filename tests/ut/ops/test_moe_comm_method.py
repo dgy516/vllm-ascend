@@ -4,11 +4,13 @@ import torch
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from tests.ut.base import TestBase
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     AlltoAllCommImpl,
     MC2CommImpl,
     MoETPAllGatherCommImpl,
+    get_moe_comm_method,
     setup_moe_comm_method,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
@@ -144,6 +146,19 @@ class TestMoECommMethod(TestBase):
         setup_moe_comm_method(self.moe_config)
 
         mock_moe_tp_impl.assert_called_once_with(self.moe_config)
+
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.MoETPAllGatherCommImpl")
+    def test_setup_moe_comm_method_keeps_existing_moe_tp_registration(self, mock_moe_tp_impl):
+        moe_tp_impl = MagicMock()
+        mock_moe_tp_impl.return_value = moe_tp_impl
+
+        setup_moe_comm_method(self.moe_config)
+        self.assertIs(get_moe_comm_method(MoECommType.MOE_TP_ALLGATHER), moe_tp_impl)
+
+        self.moe_config.moe_tp_group = None
+        setup_moe_comm_method(self.moe_config)
+
+        self.assertIs(get_moe_comm_method(MoECommType.MOE_TP_ALLGATHER), moe_tp_impl)
 
     @patch('vllm_ascend.ascend_forward_context.get_forward_context')
     @patch(

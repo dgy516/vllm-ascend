@@ -300,7 +300,10 @@ def _native_select_experts(
         return topk_weights, topk_ids
 
     topk_weights, topk_ids = topk_weights.topk(top_k, dim=-1)
-    topk_weights = topk_weights.to(hidden_states.dtype)
+    # Routing weights belong to the router/logit precision domain. Do not
+    # inherit activation dtypes here, because MoE-TP W8A8 may already carry
+    # quantized int8 activations through the prepare stage.
+    topk_weights = topk_weights.to(router_logits.dtype)
 
     # Required by npu_moe_init_routing
     topk_ids = topk_ids.to(torch.int32)

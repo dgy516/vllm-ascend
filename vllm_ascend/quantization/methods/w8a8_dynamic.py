@@ -200,6 +200,15 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             topk_weights = fc3_context.topk_weights
             topk_ids = fc3_context.topk_ids
         else:
+            if (
+                _EXTRA_CTX.moe_comm_type == MoECommType.MOE_TP_ALLGATHER
+                and custom_routing_function is not None
+                and x.dtype == torch.int8
+                and pertoken_scale is not None
+            ):
+                raise ValueError(
+                    "MoE-TP W8A8 pre-quantized routing does not support custom_routing_function."
+                )
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,

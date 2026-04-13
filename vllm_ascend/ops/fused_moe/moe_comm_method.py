@@ -60,8 +60,6 @@ def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
     if getattr(moe_config, "moe_tp_group", None) is not None:
         _MoECommMethods[MoECommType.MOE_TP_ALLGATHER] = MoETPAllGatherCommImpl(moe_config)
-    else:
-        _MoECommMethods.pop(MoECommType.MOE_TP_ALLGATHER, None)
 
 
 def set_gmmswigluquant_method():

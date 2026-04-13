@@ -23,7 +23,7 @@ from pytest_mock import MockerFixture
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_forward_context import MoECommType
-from vllm_ascend.ops.fused_moe.experts_selector import select_experts
+from vllm_ascend.ops.fused_moe.experts_selector import _native_select_experts, select_experts
 from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 from vllm_ascend.ops.fused_moe.moe_mlp import cumsum_group_list, unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
@@ -310,6 +310,27 @@ class TestExpertsSelector:
 
         assert topk_weights.shape == (8, 2)
         assert topk_ids.shape == (8, 2)
+
+    def test_native_select_experts_keeps_router_precision_for_quantized_hidden_states(self):
+        hidden_states = torch.randint(-8, 8, (8, 16), dtype=torch.int8)
+        router_logits = torch.randn(8, 32, dtype=torch.float32)
+
+        topk_weights, topk_ids = _native_select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=2,
+            use_grouped_topk=False,
+            renormalize=True,
+            topk_group=None,
+            num_expert_group=None,
+            custom_routing_function=None,
+            scoring_func="softmax",
+            e_score_correction_bias=None,
+            global_num_experts=32,
+        )
+
+        assert topk_weights.dtype == router_logits.dtype
+        assert topk_ids.dtype == torch.int32
 
 
 class TestCumsumGroupList(TestBase):
