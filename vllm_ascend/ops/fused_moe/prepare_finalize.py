@@ -483,11 +483,11 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
 class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
     """MoE-TP prepare/finalize path for DPxTP flattened routed MoE execution.
 
-    Phase 1 canonicalizes MoE inputs by selecting a single source TP rank inside
-    each DP replica, gathering unique inputs across the source ranks, then
-    broadcasting the global batch to the paired TP peer. Final outputs are
-    reduced on the dedicated MoE-TP group before each source rank slices its
-    local DP batch and broadcasts it back to the TP peer.
+    Canonicalizes MoE inputs by gathering each TP rank's duplicated DP batch
+    across the matching TP-rank group. This removes the extra peer broadcast in
+    the prepare path while preserving the same global token ordering across the
+    dedicated MoE-TP group. Final outputs are reduced on the dedicated MoE-TP
+    group before each rank slices its local DP batch.
     """
 
     def __init__(self, moe_config: FusedMoEConfig):
@@ -519,44 +519,21 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
 
         self.num_tokens = hidden_states.shape[0]
         self.max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp or self.num_tokens
-        self.is_source_rank = self.moe_peer_group.rank_in_group == self.source_tp_rank
-        if self.is_source_rank:
-            assert self.moe_source_group is not None, "source ranks must initialize moe_source_group."
-        global_num_tokens = self.max_tokens_across_dp * self.moe_source_group_world_size
+        assert self.moe_source_group is not None, "moe_source_group is required for MoE-TP mode."
         pertoken_scale = None
-        hidden_states_dtype = hidden_states.dtype
-        hidden_size = hidden_states.shape[-1]
-
-        if self.is_source_rank:
-            if quant_type == QuantType.W8A8:
-                # Only the source TP rank owns the canonical MoE inputs. Quantize
-                # there before communication so peers do not pay duplicate work.
-                hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
-            pad_size = self.max_tokens_across_dp - self.num_tokens
-            if pad_size > 0:
-                hidden_states = self._pad_along_first_dim(hidden_states, pad_size)
-                router_logits = self._pad_along_first_dim(router_logits, pad_size)
-                if pertoken_scale is not None:
-                    pertoken_scale = self._pad_along_first_dim(pertoken_scale, pad_size)
-
-            hidden_states = self.moe_source_group.all_gather(hidden_states, 0)
-            router_logits = self.moe_source_group.all_gather(router_logits, 0)
+        if quant_type == QuantType.W8A8:
+            hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+        pad_size = self.max_tokens_across_dp - self.num_tokens
+        if pad_size > 0:
+            hidden_states = self._pad_along_first_dim(hidden_states, pad_size)
+            router_logits = self._pad_along_first_dim(router_logits, pad_size)
             if pertoken_scale is not None:
-                pertoken_scale = self.moe_source_group.all_gather(pertoken_scale, 0)
-        else:
-            hidden_states = torch.empty(
-                (global_num_tokens, hidden_size),
-                device=hidden_states.device,
-                dtype=torch.int8 if quant_type == QuantType.W8A8 else hidden_states_dtype,
-            )
-            router_logits = router_logits.new_empty((global_num_tokens, router_logits.shape[-1]))
-            if quant_type == QuantType.W8A8:
-                pertoken_scale = torch.empty((global_num_tokens,), device=hidden_states.device, dtype=torch.float32)
+                pertoken_scale = self._pad_along_first_dim(pertoken_scale, pad_size)
 
-        hidden_states = self.moe_peer_group.broadcast(hidden_states, src=self.source_tp_rank)
-        router_logits = self.moe_peer_group.broadcast(router_logits, src=self.source_tp_rank)
+        hidden_states = self.moe_source_group.all_gather(hidden_states, 0)
+        router_logits = self.moe_source_group.all_gather(router_logits, 0)
         if pertoken_scale is not None:
-            pertoken_scale = self.moe_peer_group.broadcast(pertoken_scale, src=self.source_tp_rank)
+            pertoken_scale = self.moe_source_group.all_gather(pertoken_scale, 0)
 
         return MoEPrepareOutput(
             hidden_states=hidden_states,
