@@ -29,6 +29,27 @@ _P_TP: GroupCoordinator | None = None
 _DYNAMIC_EPLB: GroupCoordinator | None = None
 
 
+def init_optional_model_parallel_group(
+    group_ranks: list[list[int]],
+    local_rank: int,
+    backend: str,
+    use_message_queue_broadcaster: bool = False,
+    group_name: str | None = None,
+    use_device_communicator: bool = True,
+) -> GroupCoordinator:
+    from vllm_ascend.patch.worker.patch_distributed import GroupCoordinatorPatch
+
+    return GroupCoordinatorPatch(
+        group_ranks=group_ranks,
+        local_rank=local_rank,
+        torch_distributed_backend=backend,
+        use_device_communicator=use_device_communicator,
+        use_message_queue_broadcaster=use_message_queue_broadcaster,
+        group_name=group_name,
+        allow_non_member=True,
+    )
+
+
 def init_ascend_model_parallel(
     parallel_config: ParallelConfig,
 ):
@@ -114,16 +135,12 @@ def init_ascend_model_parallel(
         moe_source_group_ranks = [x.tolist() for x in moe_source_group_ranks]
 
         global _MOE_SOURCE
-        world_rank = get_world_group().rank
-        if any(world_rank in ranks for ranks in moe_source_group_ranks):
-            _MOE_SOURCE = init_model_parallel_group(
-                moe_source_group_ranks,
-                get_world_group().local_rank,
-                backend,
-                group_name="moe_source",
-            )
-        else:
-            _MOE_SOURCE = None
+        _MOE_SOURCE = init_optional_model_parallel_group(
+            moe_source_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="moe_source",
+        )
 
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB

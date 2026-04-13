@@ -117,3 +117,24 @@ class TestPatchDistributed(TestBase):
 
         mock_communicator.all_to_all.assert_called_once_with(
             input_tensor, scatter_dim, gather_dim, None, None)
+
+    @patch("torch.distributed.get_rank", return_value=2)
+    @patch("torch.distributed.new_group", side_effect=[MagicMock(), MagicMock()])
+    def test_allow_non_member_keeps_group_creation_order(self, mock_new_group, mock_get_rank):
+        del mock_get_rank
+        group = GroupCoordinatorPatch(
+            group_ranks=[[0, 1]],
+            local_rank=self.mock_local_rank,
+            torch_distributed_backend=self.mock_backend,
+            use_device_communicator=self.mock_use_device_comm,
+            allow_non_member=True,
+        )
+
+        self.assertEqual(group.world_size, 0)
+        self.assertEqual(group.rank_in_group, -1)
+        self.assertEqual(group.ranks, [])
+        self.assertIsNone(group.device_communicator)
+        self.assertIsNone(group.mq_broadcaster)
+        self.assertFalse(hasattr(group, "cpu_group"))
+        self.assertFalse(hasattr(group, "device_group"))
+        self.assertEqual(mock_new_group.call_count, 2)

@@ -135,6 +135,8 @@ def test_init_ascend_model_parallel_with_moe_tp(mock_distributed):
     with patch("vllm_ascend.distributed.parallel_state.model_parallel_initialized", return_value=False), patch(
         "vllm_ascend.distributed.parallel_state.init_model_parallel_group", side_effect=_init_group_side_effect
     ), patch(
+        "vllm_ascend.distributed.parallel_state.init_optional_model_parallel_group", side_effect=_init_group_side_effect
+    ), patch(
         "vllm_ascend.distributed.parallel_state.get_current_vllm_config", return_value=mock_vllm_config
     ), patch(
         "vllm_ascend.distributed.parallel_state.get_ascend_config", return_value=mock_ascend_config
@@ -158,7 +160,7 @@ def test_init_ascend_model_parallel_with_moe_tp(mock_distributed):
         assert parallel_state._MOE_SOURCE is None
 
 
-def test_init_ascend_model_parallel_with_moe_tp_peer_rank_skips_source_group():
+def test_init_ascend_model_parallel_with_moe_tp_peer_rank_builds_non_member_source_group():
     parallel_config = ParallelConfig(
         data_parallel_size=4,
         tensor_parallel_size=2,
@@ -212,6 +214,8 @@ def test_init_ascend_model_parallel_with_moe_tp_peer_rank_skips_source_group():
     ), patch(
         "vllm_ascend.distributed.parallel_state.init_model_parallel_group", side_effect=_init_group_side_effect
     ), patch(
+        "vllm_ascend.distributed.parallel_state.init_optional_model_parallel_group", side_effect=_init_group_side_effect
+    ), patch(
         "vllm_ascend.distributed.parallel_state.get_current_vllm_config", return_value=mock_vllm_config
     ), patch(
         "vllm_ascend.distributed.parallel_state.get_ascend_config", return_value=mock_ascend_config
@@ -221,8 +225,8 @@ def test_init_ascend_model_parallel_with_moe_tp_peer_rank_skips_source_group():
         init_ascend_model_parallel(parallel_config)
 
         assert get_moe_tp_group() is created_groups["moe_tp"][0]
-        assert "moe_source" not in created_groups
-        assert parallel_state._MOE_SOURCE is None
+        assert parallel_state._MOE_SOURCE is created_groups["moe_source"][0]
+        assert created_groups["moe_source"][1] == [[0, 2, 4, 6], [8, 10, 12, 14]]
 
         destroy_ascend_model_parallel()
         assert parallel_state._MOE_TP is None

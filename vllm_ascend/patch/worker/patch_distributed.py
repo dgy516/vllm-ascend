@@ -34,6 +34,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
         use_device_communicator: bool,  # whether to use device communicator
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
+        allow_non_member: bool = False,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -41,6 +42,9 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
+        self.ranks = []
+        self.world_size = 0
+        self.rank_in_group = -1
 
         self_device_group = None
         self_cpu_group = None
@@ -61,15 +65,21 @@ class GroupCoordinatorPatch(GroupCoordinator):
                 self_device_group = device_group
                 self_cpu_group = cpu_group
 
-        assert self_cpu_group is not None
-        assert self_device_group is not None
+        self.device = torch.npu.current_device()
+        self.use_device_communicator = use_device_communicator
+        self.device_communicator = None
+        self.mq_broadcaster = None
+        self.use_custom_op_call = True
+        self.use_cpu_custom_send_recv = False
+
+        if self_cpu_group is None or self_device_group is None:
+            if not allow_non_member:
+                assert self_cpu_group is not None
+                assert self_device_group is not None
+            return
 
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
-        self.device = torch.npu.current_device()
-
-        self.use_device_communicator = use_device_communicator
-        self.device_communicator = None
         if use_device_communicator and self.world_size > 1:
             self.device_communicator = NPUCommunicator(
                 cpu_group=self.cpu_group,
@@ -80,12 +90,8 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
-        self.mq_broadcaster: MessageQueue | None = None
         if use_message_queue_broadcaster and self.world_size > 1:
             self.mq_broadcaster = MessageQueue.create_from_process_group(self.cpu_group, 1 << 22, 6)
-
-        self.use_custom_op_call = True
-        self.use_cpu_custom_send_recv = False
 
     def all_to_all(
         self,
