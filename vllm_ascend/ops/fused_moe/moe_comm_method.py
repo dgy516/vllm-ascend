@@ -36,6 +36,7 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalizeWithAll2All,
     PrepareAndFinalizeWithAllGather,
     PrepareAndFinalizeWithMC2,
+    PrepareAndFinalizeWithMoETPAllGather,
 )
 from vllm_ascend.ops.fused_moe.token_dispatcher import (
     MoETokenDispatcher,
@@ -57,6 +58,10 @@ def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
     _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
     _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
+    if getattr(moe_config, "moe_tp_group", None) is not None:
+        _MoECommMethods[MoECommType.MOE_TP_ALLGATHER] = MoETPAllGatherCommImpl(moe_config)
+    else:
+        _MoECommMethods.pop(MoECommType.MOE_TP_ALLGATHER, None)
 
 
 def set_gmmswigluquant_method():
@@ -197,6 +202,13 @@ class AllGatherCommImpl(MoECommMethod):
 
     def _get_prepare_finalize(self):
         return PrepareAndFinalizeWithAllGather(self.moe_config)
+
+
+class MoETPAllGatherCommImpl(AllGatherCommImpl):
+    """MoE-TP specific all-gather path with source-rank canonicalization."""
+
+    def _get_prepare_finalize(self):
+        return PrepareAndFinalizeWithMoETPAllGather(self.moe_config)
 
 
 class MC2CommImpl(MoECommMethod):

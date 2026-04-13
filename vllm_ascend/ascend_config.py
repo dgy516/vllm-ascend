@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -43,6 +43,9 @@ class AscendConfig:
 
         finegrained_tp_config = additional_config.get("finegrained_tp_config", {})
         self.finegrained_tp_config = FinegrainedTPConfig(finegrained_tp_config, vllm_config)
+
+        moe_parallel_config = additional_config.get("moe_parallel_config", {})
+        self.moe_parallel_config = MoeParallelConfig(moe_parallel_config, vllm_config)
 
         eplb_config = additional_config.get("eplb_config", {})
         self.eplb_config = EplbConfig(eplb_config)
@@ -129,10 +132,10 @@ class AscendConfig:
         # when enable_async_exponential is True, AscendSampler will be different from vllm Sampler,
         # which make batch_invariant mode not working.
         # so we disable async exponential when batch_invariant mode is enabled.
-        from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
+        import vllm.envs as envs
 
         self.enable_async_exponential = (
-            bool(additional_config.get("enable_async_exponential", False)) and not vllm_is_batch_invariant()
+            bool(additional_config.get("enable_async_exponential", False)) and not envs.VLLM_BATCH_INVARIANT
         )
 
         use_sparse = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
@@ -158,7 +161,11 @@ class AscendConfig:
             and use_sparse
             and get_ascend_device_type() != AscendDeviceType.A5
         )
-
+        quant_config = getattr(vllm_config, "quant_config", None)
+        self._sparse_c8_layer_ids, self._sparse_c8_layer_names = self._parse_sparse_c8_layers_from_quant_config(
+            quant_config
+        )
+        self._sparse_c8_layer_filter_enabled = self._has_sparse_c8_layer_config(quant_config)
         self.enable_sp_by_pass = (
             vllm_config.model_config is not None
             and not vllm_config.model_config.enforce_eager
@@ -167,6 +174,95 @@ class AscendConfig:
 
         # Enable dispatch/combine op inter-node communication by ROCE
         self.enable_mc2_hierarchy_comm = additional_config.get("enable_mc2_hierarchy_comm", False)
+
+        self.mix_placement = additional_config.get("mix_placement", False)
+        self._check_mix_placement()
+        self._check_moe_parallel_config()
+
+    def _check_mix_placement(self):
+        if self.mix_placement:
+            if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
+                raise ValueError("Mix placement is not supported with shared expert DP or multistream overlap.")
+
+    def _check_moe_parallel_config(self):
+        if not self.moe_parallel_config.enabled:
+            return
+
+        parallel_config = self.vllm_config.parallel_config
+        if parallel_config.enable_expert_parallel:
+            raise ValueError("moe_parallel_config.mode=tensor_parallel requires enable_expert_parallel=False.")
+        if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
+            raise ValueError("moe_parallel_config.mode=tensor_parallel is incompatible with shared expert DP.")
+        if self.multistream_overlap_gate:
+            raise ValueError("moe_parallel_config.mode=tensor_parallel does not support multistream_overlap_gate.")
+        if self.mix_placement:
+            raise ValueError("moe_parallel_config.mode=tensor_parallel does not support mix placement.")
+
+        eplb_config = self.eplb_config
+        if (
+            eplb_config.dynamic_eplb
+            or eplb_config.expert_map_path is not None
+            or eplb_config.expert_map_record_path is not None
+            or eplb_config.num_redundant_experts > 0
+        ):
+            raise ValueError("moe_parallel_config.mode=tensor_parallel does not support EPLB or expert remapping.")
+
+        from vllm_ascend.utils import enable_sp
+
+        if enable_sp(vllm_config=self.vllm_config) or self.enable_sp_by_pass:
+            raise ValueError("moe_parallel_config.mode=tensor_parallel is incompatible with FLASHCOMM1.")
+
+    def moe_tp_mode_enabled(self) -> bool:
+        return self.moe_parallel_config.enabled
+
+    @staticmethod
+    def _has_sparse_c8_layer_config(quant_config: Any) -> bool:
+        quant_description = getattr(quant_config, "quant_description", None)
+        if not isinstance(quant_description, dict):
+            return False
+        return any(isinstance(key, str) and key.endswith(".indexer.quant_type") for key in quant_description)
+
+    @classmethod
+    def _parse_sparse_c8_layers_from_quant_config(cls, quant_config: Any) -> tuple[set[int], set[str]]:
+        quant_description = getattr(quant_config, "quant_description", None)
+        if not isinstance(quant_description, dict):
+            return set(), set()
+
+        layer_ids: set[int] = set()
+        layer_names: set[str] = set()
+        suffix = ".indexer.quant_type"
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        for key, value in quant_description.items():
+            if not isinstance(key, str) or not key.endswith(suffix):
+                continue
+            if value != "INT8_DYNAMIC":
+                continue
+            layer_name = key[: -len(suffix)].rstrip(".")
+            if not layer_name:
+                continue
+            layer_names.add(layer_name)
+            layer_ids.update({extract_layer_index(layer_name)})
+        return layer_ids, layer_names
+
+    def is_sparse_c8_layer(self, layer_name: str | None) -> bool:
+        if not self.enable_sparse_c8:
+            return False
+        if not self._sparse_c8_layer_filter_enabled:
+            return True
+        if layer_name is None:
+            return False
+
+        normalized_layer_name = layer_name.rstrip(".")
+        if any(
+            normalized_layer_name == candidate or normalized_layer_name.startswith(f"{candidate}.")
+            for candidate in self._sparse_c8_layer_names
+        ):
+            return True
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        layer_ids = {extract_layer_index(normalized_layer_name)}
+        return any(layer_id in self._sparse_c8_layer_ids for layer_id in layer_ids)
 
     @staticmethod
     def _get_compile_ranges(compilation_config):
@@ -248,6 +344,75 @@ class FinegrainedTPConfig:
                 raise AssertionError("module tp sizes must divide data_parallel_size")
         if any(size > 0 for size in module_tp_sizes) and enabled_configs:
             logger.info(f"finegrained_tp_config enabled: {', '.join(enabled_configs)}")
+
+
+class MoeParallelConfig:
+    """
+    Configuration Object for moe_parallel_config from additional_config
+    """
+
+    _SUPPORTED_MODES = {"disabled", "tensor_parallel"}
+
+    def __init__(self, moe_parallel_config: dict | None, vllm_config):
+        if moe_parallel_config is None:
+            moe_parallel_config = {}
+        if not isinstance(moe_parallel_config, dict):
+            raise TypeError("moe_parallel_config must be a dict.")
+
+        self.mode = moe_parallel_config.get("mode", "disabled")
+        self.moe_tensor_parallel_size = moe_parallel_config.get("moe_tensor_parallel_size", 0)
+        self.source_tp_rank = moe_parallel_config.get("source_tp_rank", 0)
+
+        self._validate(vllm_config)
+
+        if self.enabled:
+            logger.info(
+                "moe_parallel_config enabled: mode=%s, moe_tensor_parallel_size=%s, source_tp_rank=%s",
+                self.mode,
+                self.moe_tensor_parallel_size,
+                self.source_tp_rank,
+            )
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode == "tensor_parallel"
+
+    def _validate(self, vllm_config):
+        if self.mode not in self._SUPPORTED_MODES:
+            raise ValueError(
+                f"Unsupported moe_parallel_config.mode={self.mode!r}. "
+                f"Supported values: {sorted(self._SUPPORTED_MODES)}."
+            )
+        if not isinstance(self.moe_tensor_parallel_size, int):
+            raise TypeError("moe_tensor_parallel_size must be an integer.")
+        if not isinstance(self.source_tp_rank, int):
+            raise TypeError("source_tp_rank must be an integer.")
+
+        if not self.enabled:
+            if self.moe_tensor_parallel_size != 0:
+                raise ValueError("moe_tensor_parallel_size must be 0 when moe_parallel_config.mode is disabled.")
+            if self.source_tp_rank != 0:
+                raise ValueError("source_tp_rank must be 0 when moe_parallel_config.mode is disabled.")
+            return
+
+        parallel_config = vllm_config.parallel_config
+        if self.moe_tensor_parallel_size <= 0:
+            raise ValueError("moe_tensor_parallel_size must be greater than 0 in tensor_parallel mode.")
+        if parallel_config.tensor_parallel_size != 2:
+            raise AssertionError("moe_parallel_config.mode=tensor_parallel currently requires tensor_parallel_size=2.")
+        if parallel_config.prefill_context_parallel_size != 1:
+            raise AssertionError(
+                "moe_parallel_config.mode=tensor_parallel currently requires prefill_context_parallel_size=1."
+            )
+
+        expected_moe_tp_size = parallel_config.data_parallel_size * parallel_config.tensor_parallel_size
+        if self.moe_tensor_parallel_size != expected_moe_tp_size:
+            raise AssertionError(
+                "moe_parallel_config.mode=tensor_parallel requires "
+                "moe_tensor_parallel_size == data_parallel_size * tensor_parallel_size."
+            )
+        if not 0 <= self.source_tp_rank < parallel_config.tensor_parallel_size:
+            raise AssertionError("source_tp_rank must be in [0, tensor_parallel_size).")
 
 
 class AscendCompilationConfig:
@@ -339,8 +504,9 @@ class XliteGraphConfig:
                     "Please set pipeline_parallel_size to 1."
                 )
             if vllm_config.cache_config.block_size != 128:
-                raise RuntimeError(
-                    "Xlite graph mode is only compatible with block_size of 128. Please set block_size to 128."
+                logger.warning(
+                    f"Current cache block size is {vllm_config.cache_config.block_size}, which may not be optimal or "
+                    f"compatible with xlite graph mode. The recommended block size for xlite graph mode is 128."
                 )
 
 

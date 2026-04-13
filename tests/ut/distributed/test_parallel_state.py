@@ -3,11 +3,26 @@ from unittest.mock import MagicMock, patch
 import pytest
 from vllm.config import ParallelConfig
 
+import vllm_ascend.distributed.parallel_state as parallel_state
 from vllm_ascend.distributed.parallel_state import (
-    _FLASHCOMM2_ODP, _FLASHCOMM2_OTP, _LMTP, _MC2, _OTP, _P_TP,
-    destroy_ascend_model_parallel, get_flashcomm2_odp_group,
-    get_flashcomm2_otp_group, get_lmhead_tp_group, get_mc2_group,
-    get_otp_group, get_p_tp_group, init_ascend_model_parallel)
+    _FLASHCOMM2_ODP,
+    _FLASHCOMM2_OTP,
+    _LMTP,
+    _MC2,
+    _OTP,
+    _P_TP,
+    destroy_ascend_model_parallel,
+    get_flashcomm2_odp_group,
+    get_flashcomm2_otp_group,
+    get_lmhead_tp_group,
+    get_mc2_group,
+    get_moe_peer_group,
+    get_moe_source_group,
+    get_moe_tp_group,
+    get_otp_group,
+    get_p_tp_group,
+    init_ascend_model_parallel,
+)
 
 
 @pytest.fixture
@@ -38,10 +53,14 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
     mock_ascend_config.finegrained_tp_config.oproj_tensor_parallel_size = 2
     mock_ascend_config.finegrained_tp_config.embedding_tensor_parallel_size = 2
     mock_ascend_config.finegrained_tp_config.mlp_tensor_parallel_size = 2
+    mock_ascend_config.moe_parallel_config.enabled = False
     mock_ascend_config.flashcomm2_oproj_tensor_parallel_size = 2
     mock_ascend_config.pd_tp_ratio = 2
     mock_ascend_config.num_head_replica = 0
     mock_ascend_config.pd_head_ratio = 2
+    mock_ascend_config.eplb_config.dynamic_eplb = False
+    mock_ascend_config.multistream_overlap_gate = False
+    mock_ascend_config.layer_sharding = None
     mock_vllm_config = MagicMock()
     mock_vllm_config.kv_transfer_config.is_kv_producer = True
     mock_envs_ascend = MagicMock()
@@ -75,3 +94,65 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
         assert _FLASHCOMM2_OTP is None
         assert _FLASHCOMM2_ODP is None
         assert _P_TP is None
+
+
+def test_init_ascend_model_parallel_with_moe_tp(mock_distributed):
+    parallel_config = ParallelConfig(
+        data_parallel_size=4,
+        tensor_parallel_size=2,
+        pipeline_parallel_size=1,
+    )
+
+    mock_ascend_config = MagicMock()
+    mock_ascend_config.finegrained_tp_config.lmhead_tensor_parallel_size = 0
+    mock_ascend_config.finegrained_tp_config.oproj_tensor_parallel_size = 0
+    mock_ascend_config.finegrained_tp_config.embedding_tensor_parallel_size = 0
+    mock_ascend_config.finegrained_tp_config.mlp_tensor_parallel_size = 0
+    mock_ascend_config.moe_parallel_config.enabled = True
+    mock_ascend_config.moe_parallel_config.source_tp_rank = 0
+    mock_ascend_config.flashcomm2_oproj_tensor_parallel_size = 1
+    mock_ascend_config.pd_tp_ratio = 1
+    mock_ascend_config.num_head_replica = 0
+    mock_ascend_config.pd_head_ratio = 1
+    mock_ascend_config.eplb_config.dynamic_eplb = False
+    mock_ascend_config.multistream_overlap_gate = False
+    mock_ascend_config.layer_sharding = None
+
+    mock_vllm_config = MagicMock()
+    mock_vllm_config.kv_transfer_config = None
+    mock_envs_ascend = MagicMock()
+    mock_envs_ascend.VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE = 1
+    mock_envs_ascend.VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL = 0
+
+    created_groups = {}
+
+    def _init_group_side_effect(group_ranks, local_rank, backend, group_name):
+        group = MagicMock(name=group_name)
+        group.group_name = group_name
+        created_groups[group_name] = (group, group_ranks)
+        return group
+
+    with patch("vllm_ascend.distributed.parallel_state.model_parallel_initialized", return_value=False), patch(
+        "vllm_ascend.distributed.parallel_state.init_model_parallel_group", side_effect=_init_group_side_effect
+    ), patch(
+        "vllm_ascend.distributed.parallel_state.get_current_vllm_config", return_value=mock_vllm_config
+    ), patch(
+        "vllm_ascend.distributed.parallel_state.get_ascend_config", return_value=mock_ascend_config
+    ), patch("vllm_ascend.utils.envs_ascend", new=mock_envs_ascend), patch(
+        "vllm_ascend.utils.get_ascend_config", return_value=mock_ascend_config
+    ):
+        init_ascend_model_parallel(parallel_config)
+
+        moe_tp_group = get_moe_tp_group()
+        moe_source_group = get_moe_source_group()
+        moe_peer_group = get_moe_peer_group()
+
+        assert moe_tp_group is created_groups["moe_tp"][0]
+        assert moe_source_group is created_groups["moe_source"][0]
+        assert moe_peer_group is not None
+        assert created_groups["moe_tp"][1] == [[0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15]]
+        assert created_groups["moe_source"][1] == [[0, 2, 4, 6], [8, 10, 12, 14]]
+
+        destroy_ascend_model_parallel()
+        assert parallel_state._MOE_TP is None
+        assert parallel_state._MOE_SOURCE is None

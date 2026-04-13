@@ -111,6 +111,15 @@ class PrepareAndFinalize(ABC):
         """
         raise NotImplementedError("Finalize function not implemented.")
 
+    @staticmethod
+    def _pad_along_first_dim(tensor: torch.Tensor, pad_size: int) -> torch.Tensor:
+        if pad_size <= 0:
+            return tensor
+
+        pad_args = [0, 0] * tensor.dim()
+        pad_args[-1] = pad_size
+        return nn.functional.pad(tensor, tuple(pad_args))
+
 
 class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
     """
@@ -468,4 +477,104 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
 
         if prefill_context_parallel_enable() and self.moe_config.pcp_size > 1:
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
+        return hidden_states
+
+
+class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
+    """MoE-TP prepare/finalize path for DPxTP flattened routed MoE execution.
+
+    Phase 1 canonicalizes MoE inputs by selecting a single source TP rank inside
+    each DP replica, gathering unique inputs across the source ranks, then
+    broadcasting the global batch to the paired TP peer. Final outputs are
+    reduced on the dedicated MoE-TP group before each source rank slices its
+    local DP batch and broadcasts it back to the TP peer.
+    """
+
+    def __init__(self, moe_config: FusedMoEConfig):
+        super().__init__(moe_config)
+        self.source_tp_rank = getattr(moe_config, "source_tp_rank", 0)
+        self.moe_tp_group = getattr(moe_config, "moe_tp_group", None)
+        self.moe_source_group = getattr(moe_config, "moe_source_group", None)
+        self.moe_peer_group = getattr(moe_config, "moe_peer_group", None)
+
+        assert self.moe_tp_group is not None, "moe_tp_group is required for MoE-TP mode."
+        assert self.moe_source_group is not None, "moe_source_group is required for MoE-TP mode."
+        assert self.moe_peer_group is not None, "moe_peer_group is required for MoE-TP mode."
+
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False,
+        quant_type=QuantType.NONE,
+    ) -> MoEPrepareOutput:
+        if replace_allreduce:
+            raise ValueError("MoE-TP tensor_parallel mode does not support FLASHCOMM1 replace_allreduce path.")
+        if enable_shared_expert_dp:
+            raise ValueError("MoE-TP tensor_parallel mode does not support shared expert DP.")
+
+        self.num_tokens = hidden_states.shape[0]
+        self.max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp or self.num_tokens
+        self.is_source_rank = self.moe_peer_group.rank_in_group == self.source_tp_rank
+        global_num_tokens = self.max_tokens_across_dp * self.moe_source_group.world_size
+        pertoken_scale = None
+        hidden_states_dtype = hidden_states.dtype
+        hidden_size = hidden_states.shape[-1]
+
+        if self.is_source_rank:
+            if quant_type == QuantType.W8A8:
+                # Only the source TP rank owns the canonical MoE inputs. Quantize
+                # there before communication so peers do not pay duplicate work.
+                hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+            pad_size = self.max_tokens_across_dp - self.num_tokens
+            if pad_size > 0:
+                hidden_states = self._pad_along_first_dim(hidden_states, pad_size)
+                router_logits = self._pad_along_first_dim(router_logits, pad_size)
+                if pertoken_scale is not None:
+                    pertoken_scale = self._pad_along_first_dim(pertoken_scale, pad_size)
+
+            hidden_states = self.moe_source_group.all_gather(hidden_states, 0)
+            router_logits = self.moe_source_group.all_gather(router_logits, 0)
+            if pertoken_scale is not None:
+                pertoken_scale = self.moe_source_group.all_gather(pertoken_scale, 0)
+        else:
+            hidden_states = torch.empty(
+                (global_num_tokens, hidden_size),
+                device=hidden_states.device,
+                dtype=torch.int8 if quant_type == QuantType.W8A8 else hidden_states_dtype,
+            )
+            router_logits = router_logits.new_empty((global_num_tokens, router_logits.shape[-1]))
+            if quant_type == QuantType.W8A8:
+                pertoken_scale = torch.empty((global_num_tokens,), device=hidden_states.device, dtype=torch.float32)
+
+        hidden_states = self.moe_peer_group.broadcast(hidden_states, src=self.source_tp_rank)
+        router_logits = self.moe_peer_group.broadcast(router_logits, src=self.source_tp_rank)
+        if pertoken_scale is not None:
+            pertoken_scale = self.moe_peer_group.broadcast(pertoken_scale, src=self.source_tp_rank)
+
+        return MoEPrepareOutput(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            mc2_mask=None,
+            padded_hidden_states_shape=None,
+            pertoken_scale=pertoken_scale,
+        )
+
+    def finalize(
+        self,
+        hidden_states: torch.Tensor,
+        reduce_results: bool,
+        padded_hidden_states_shape: torch.Size | None = None,
+    ) -> torch.Tensor:
+        del reduce_results, padded_hidden_states_shape
+
+        hidden_states = self.moe_tp_group.all_reduce(hidden_states)
+        if self.is_source_rank:
+            local_batch_offset = self.moe_source_group.rank_in_group * self.max_tokens_across_dp
+            hidden_states = hidden_states[local_batch_offset : local_batch_offset + self.num_tokens]
+        else:
+            hidden_states = hidden_states.new_empty((self.num_tokens, hidden_states.shape[-1]))
+
+        hidden_states = self.moe_peer_group.broadcast(hidden_states, src=self.source_tp_rank)
         return hidden_states

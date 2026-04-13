@@ -112,3 +112,105 @@ class TestAscendConfig(TestBase):
         clear_ascend_config()
         with self.assertRaises(RuntimeError):
             get_ascend_config()
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.utils.enable_sp", return_value=False)
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_init_ascend_config_with_moe_parallel_config(self, mock_fix_incompatible_config, mock_enable_sp):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.parallel_config.data_parallel_size = 4
+        test_vllm_config.parallel_config.tensor_parallel_size = 2
+        test_vllm_config.parallel_config.prefill_context_parallel_size = 1
+        test_vllm_config.parallel_config.enable_expert_parallel = False
+        test_vllm_config.additional_config = {
+            "moe_parallel_config": {
+                "mode": "tensor_parallel",
+                "moe_tensor_parallel_size": 8,
+                "source_tp_rank": 0,
+            },
+            "refresh": True,
+        }
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertTrue(ascend_config.moe_parallel_config.enabled)
+        self.assertTrue(ascend_config.moe_tp_mode_enabled())
+        self.assertEqual(ascend_config.moe_parallel_config.moe_tensor_parallel_size, 8)
+        self.assertEqual(ascend_config.moe_parallel_config.source_tp_rank, 0)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.utils.enable_sp", return_value=False)
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_init_ascend_config_rejects_moe_parallel_with_ep(self, mock_fix_incompatible_config, mock_enable_sp):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.parallel_config.data_parallel_size = 4
+        test_vllm_config.parallel_config.tensor_parallel_size = 2
+        test_vllm_config.parallel_config.prefill_context_parallel_size = 1
+        test_vllm_config.parallel_config.enable_expert_parallel = True
+        test_vllm_config.additional_config = {
+            "moe_parallel_config": {
+                "mode": "tensor_parallel",
+                "moe_tensor_parallel_size": 8,
+                "source_tp_rank": 0,
+            },
+            "refresh": True,
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "moe_parallel_config.mode=tensor_parallel requires enable_expert_parallel=False.",
+        ):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.utils.enable_sp", return_value=True)
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_init_ascend_config_rejects_moe_parallel_with_flashcomm1(
+        self, mock_fix_incompatible_config, mock_enable_sp
+    ):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.parallel_config.data_parallel_size = 4
+        test_vllm_config.parallel_config.tensor_parallel_size = 2
+        test_vllm_config.parallel_config.prefill_context_parallel_size = 1
+        test_vllm_config.parallel_config.enable_expert_parallel = False
+        test_vllm_config.additional_config = {
+            "moe_parallel_config": {
+                "mode": "tensor_parallel",
+                "moe_tensor_parallel_size": 8,
+                "source_tp_rank": 0,
+            },
+            "refresh": True,
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "moe_parallel_config.mode=tensor_parallel is incompatible with FLASHCOMM1.",
+        ):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.utils.enable_sp", return_value=False)
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_init_ascend_config_rejects_moe_parallel_with_overlap_gate(
+        self, mock_fix_incompatible_config, mock_enable_sp
+    ):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.parallel_config.data_parallel_size = 4
+        test_vllm_config.parallel_config.tensor_parallel_size = 2
+        test_vllm_config.parallel_config.prefill_context_parallel_size = 1
+        test_vllm_config.parallel_config.enable_expert_parallel = False
+        test_vllm_config.additional_config = {
+            "moe_parallel_config": {
+                "mode": "tensor_parallel",
+                "moe_tensor_parallel_size": 8,
+                "source_tp_rank": 0,
+            },
+            "multistream_overlap_gate": True,
+            "refresh": True,
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "moe_parallel_config.mode=tensor_parallel does not support multistream_overlap_gate.",
+        ):
+            init_ascend_config(test_vllm_config)

@@ -6,7 +6,8 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalizeWithAll2All, PrepareAndFinalizeWithAllGather,
-    PrepareAndFinalizeWithMC2)
+    PrepareAndFinalizeWithMC2, PrepareAndFinalizeWithMoETPAllGather)
+from vllm_ascend.quantization.quant_type import QuantType
 
 
 class TestPrepareAndFinalize(unittest.TestCase):
@@ -24,6 +25,10 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.moe_config.tp_size = 1
         self.moe_config.ep_size = 1
         self.moe_config.dp_group = MagicMock()
+        self.moe_config.moe_tp_group = MagicMock()
+        self.moe_config.moe_source_group = MagicMock()
+        self.moe_config.moe_peer_group = MagicMock()
+        self.moe_config.source_tp_rank = 0
         self.moe_config.original_num_experts = 8
 
     @patch(
@@ -243,3 +248,131 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
         result_with_tp = layer.finalize(h_out, reduce_results=True)
         self.assertEqual(result_with_tp.shape[0], 3)
+
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize._EXTRA_CTX")
+    def test_moe_tp_prepare_finalize_source_rank(self, mock_extra_ctx):
+        mock_extra_ctx.max_tokens_across_dp = 4
+
+        self.moe_config.moe_source_group.world_size = 2
+        self.moe_config.moe_source_group.rank_in_group = 1
+        self.moe_config.moe_peer_group.rank_in_group = 0
+
+        def mock_source_all_gather(tensor, dim):
+            return torch.cat([tensor, tensor + 10], dim=dim)
+
+        self.moe_config.moe_source_group.all_gather = mock_source_all_gather
+        self.moe_config.moe_peer_group.broadcast = lambda tensor, src: tensor
+        self.moe_config.moe_tp_group.all_reduce = lambda tensor: tensor + 100
+
+        layer = PrepareAndFinalizeWithMoETPAllGather(self.moe_config)
+        hidden_states = torch.arange(6, dtype=torch.float32).view(3, 2)
+        router_logits = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+        prepare_output = layer.prepare(hidden_states, router_logits)
+        self.assertEqual(prepare_output.hidden_states.shape, torch.Size([8, 2]))
+        self.assertEqual(prepare_output.router_logits.shape, torch.Size([8, 4]))
+
+        result = layer.finalize(prepare_output.hidden_states, reduce_results=True)
+        self.assertTrue(torch.equal(result, hidden_states + 110))
+
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize._EXTRA_CTX")
+    def test_moe_tp_prepare_finalize_peer_rank(self, mock_extra_ctx):
+        mock_extra_ctx.max_tokens_across_dp = 3
+
+        expected_global_hidden = torch.full((6, 2), 7.0)
+        expected_global_router = torch.full((6, 4), 11.0)
+        expected_local_hidden = torch.full((2, 2), 23.0)
+
+        self.moe_config.moe_source_group.world_size = 2
+        self.moe_config.moe_source_group.rank_in_group = 0
+        self.moe_config.moe_peer_group.rank_in_group = 1
+
+        def mock_peer_broadcast(tensor, src):
+            if tuple(tensor.shape) == (6, 2):
+                tensor.copy_(expected_global_hidden)
+            elif tuple(tensor.shape) == (6, 4):
+                tensor.copy_(expected_global_router)
+            elif tuple(tensor.shape) == (2, 2):
+                tensor.copy_(expected_local_hidden)
+            return tensor
+
+        self.moe_config.moe_peer_group.broadcast = mock_peer_broadcast
+        self.moe_config.moe_tp_group.all_reduce = lambda tensor: tensor + 5
+
+        layer = PrepareAndFinalizeWithMoETPAllGather(self.moe_config)
+        hidden_states = torch.arange(4, dtype=torch.float32).view(2, 2)
+        router_logits = torch.arange(8, dtype=torch.float32).view(2, 4)
+
+        prepare_output = layer.prepare(hidden_states, router_logits)
+        self.assertTrue(torch.equal(prepare_output.hidden_states, expected_global_hidden))
+        self.assertTrue(torch.equal(prepare_output.router_logits, expected_global_router))
+
+        result = layer.finalize(prepare_output.hidden_states, reduce_results=True)
+        self.assertTrue(torch.equal(result, expected_local_hidden))
+
+    @patch("torch_npu.npu_dynamic_quant")
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize._EXTRA_CTX")
+    def test_moe_tp_prepare_finalize_w8a8_quantizes_before_communication(self, mock_extra_ctx, mock_dynamic_quant):
+        mock_extra_ctx.max_tokens_across_dp = 4
+
+        quant_hidden_states = torch.full((3, 2), 5, dtype=torch.int8)
+        quant_scales = torch.full((3,), 0.25, dtype=torch.float32)
+        mock_dynamic_quant.return_value = (quant_hidden_states, quant_scales)
+
+        self.moe_config.moe_source_group.world_size = 2
+        self.moe_config.moe_source_group.rank_in_group = 0
+        self.moe_config.moe_peer_group.rank_in_group = 0
+
+        def mock_source_all_gather(tensor, dim):
+            return torch.cat([tensor, tensor], dim=dim)
+
+        self.moe_config.moe_source_group.all_gather = mock_source_all_gather
+        self.moe_config.moe_peer_group.broadcast = lambda tensor, src: tensor
+        self.moe_config.moe_tp_group.all_reduce = lambda tensor: tensor
+
+        layer = PrepareAndFinalizeWithMoETPAllGather(self.moe_config)
+        hidden_states = torch.arange(6, dtype=torch.float32).view(3, 2)
+        router_logits = torch.arange(12, dtype=torch.float32).view(3, 4)
+
+        prepare_output = layer.prepare(hidden_states, router_logits, quant_type=QuantType.W8A8)
+
+        mock_dynamic_quant.assert_called_once()
+        self.assertEqual(prepare_output.hidden_states.dtype, torch.int8)
+        self.assertEqual(prepare_output.hidden_states.shape, torch.Size([8, 2]))
+        self.assertEqual(prepare_output.pertoken_scale.shape, torch.Size([8]))
+
+    @patch("torch_npu.npu_dynamic_quant")
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize._EXTRA_CTX")
+    def test_moe_tp_prepare_finalize_w8a8_peer_rank_skips_duplicate_quant(self, mock_extra_ctx, mock_dynamic_quant):
+        mock_extra_ctx.max_tokens_across_dp = 3
+
+        expected_global_hidden = torch.full((6, 2), 5, dtype=torch.int8)
+        expected_global_router = torch.full((6, 4), 11.0)
+        expected_global_scale = torch.full((6,), 0.125, dtype=torch.float32)
+
+        self.moe_config.moe_source_group.world_size = 2
+        self.moe_config.moe_source_group.rank_in_group = 0
+        self.moe_config.moe_peer_group.rank_in_group = 1
+
+        def mock_peer_broadcast(tensor, src):
+            if tuple(tensor.shape) == (6, 2):
+                tensor.copy_(expected_global_hidden)
+            elif tuple(tensor.shape) == (6, 4):
+                tensor.copy_(expected_global_router)
+            elif tuple(tensor.shape) == (6,):
+                tensor.copy_(expected_global_scale)
+            return tensor
+
+        self.moe_config.moe_peer_group.broadcast = mock_peer_broadcast
+        self.moe_config.moe_tp_group.all_reduce = lambda tensor: tensor
+
+        layer = PrepareAndFinalizeWithMoETPAllGather(self.moe_config)
+        hidden_states = torch.arange(4, dtype=torch.float32).view(2, 2)
+        router_logits = torch.arange(8, dtype=torch.float32).view(2, 4)
+
+        prepare_output = layer.prepare(hidden_states, router_logits, quant_type=QuantType.W8A8)
+
+        mock_dynamic_quant.assert_not_called()
+        self.assertTrue(torch.equal(prepare_output.hidden_states, expected_global_hidden))
+        self.assertTrue(torch.equal(prepare_output.router_logits, expected_global_router))
+        self.assertTrue(torch.equal(prepare_output.pertoken_scale, expected_global_scale))

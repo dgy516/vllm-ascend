@@ -8,6 +8,8 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
     AllGatherCommImpl,
     AlltoAllCommImpl,
     MC2CommImpl,
+    MoETPAllGatherCommImpl,
+    setup_moe_comm_method,
 )
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
@@ -35,6 +37,10 @@ class TestMoECommMethod(TestBase):
         self.moe_config.tp_size = 1
         self.moe_config.ep_size = 1
         self.moe_config.dp_group = MagicMock()
+        self.moe_config.moe_tp_group = MagicMock()
+        self.moe_config.moe_source_group = MagicMock()
+        self.moe_config.moe_peer_group = MagicMock()
+        self.moe_config.source_tp_rank = 0
         self.moe_config.global_redundant_expert_num = 0
 
     @patch('vllm_ascend.ascend_forward_context.get_forward_context')
@@ -85,6 +91,59 @@ class TestMoECommMethod(TestBase):
                            reduce_results=True,
                            padded_hidden_states_shape=padded_hidden_states_shape)
         mock_pf_instance.finalize.assert_called_once_with(h_out, True, None)
+
+    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+    @patch(
+        "vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithMoETPAllGather"
+    )
+    @patch(
+        "vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather"
+    )
+    def test_moe_tp_all_gather_comm_impl(self, mock_token_dispatcher,
+                                         mock_prepare_finalize,
+                                         mock_get_forward_context):
+        mock_context = MagicMock()
+        mock_context.moe_comm_method = "moe_tp_all_gather"
+        mock_get_forward_context.return_value = mock_context
+
+        mock_pf_instance = MagicMock()
+        mock_pf_instance.prepare.return_value = MoEPrepareOutput(
+            hidden_states=torch.randn(8, 8),
+            router_logits=torch.randn(8, 2),
+            mc2_mask=None,
+            padded_hidden_states_shape=None)
+        mock_pf_instance.finalize.return_value = torch.randn(4, 8)
+        mock_prepare_finalize.return_value = mock_pf_instance
+
+        mock_td_instance = MagicMock()
+        mock_token_dispatcher.return_value = mock_td_instance
+
+        comm_impl = MoETPAllGatherCommImpl(self.moe_config)
+
+        hidden_states = torch.randn(3, 8)
+        router_logits = torch.randn(3, 2)
+        prepare_output = comm_impl.prepare(hidden_states, router_logits)
+        h_out = prepare_output.hidden_states
+
+        mock_pf_instance.prepare.assert_called_once_with(
+            hidden_states, router_logits, False, False, QuantType.NONE)
+
+        comm_impl.finalize(h_out, reduce_results=True, padded_hidden_states_shape=None)
+        mock_pf_instance.finalize.assert_called_once_with(h_out, True, None)
+
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.MoETPAllGatherCommImpl")
+    def test_setup_moe_comm_method_skips_moe_tp_when_groups_missing(self, mock_moe_tp_impl):
+        self.moe_config.moe_tp_group = None
+
+        setup_moe_comm_method(self.moe_config)
+
+        mock_moe_tp_impl.assert_not_called()
+
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.MoETPAllGatherCommImpl")
+    def test_setup_moe_comm_method_registers_moe_tp_when_groups_present(self, mock_moe_tp_impl):
+        setup_moe_comm_method(self.moe_config)
+
+        mock_moe_tp_impl.assert_called_once_with(self.moe_config)
 
     @patch('vllm_ascend.ascend_forward_context.get_forward_context')
     @patch(

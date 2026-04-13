@@ -7,6 +7,8 @@ from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable
 
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
+_MOE_TP: GroupCoordinator | None = None
+_MOE_SOURCE: GroupCoordinator | None = None
 
 # Module specific tensor parallel groups
 _MLP_TP: GroupCoordinator | None = None
@@ -94,6 +96,30 @@ def init_ascend_model_parallel(
 
     global _MC2
     _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
+
+    moe_parallel_config = get_ascend_config().moe_parallel_config
+    if moe_parallel_config.enabled:
+        global _MOE_TP
+        _MOE_TP = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="moe_tp")
+
+        moe_source_group_ranks = (
+            all_ranks[..., moe_parallel_config.source_tp_rank]
+            .transpose(1, 2)
+            .reshape(
+                -1,
+                global_dp_size * global_pcp_size,
+            )
+            .unbind(0)
+        )
+        moe_source_group_ranks = [x.tolist() for x in moe_source_group_ranks]
+
+        global _MOE_SOURCE
+        _MOE_SOURCE = init_model_parallel_group(
+            moe_source_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="moe_source",
+        )
 
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB
@@ -235,6 +261,21 @@ def get_mc2_group() -> GroupCoordinator:
     return _MC2
 
 
+def get_moe_tp_group() -> GroupCoordinator:
+    assert _MOE_TP is not None, "moe tp group is not initialized"
+    return _MOE_TP
+
+
+def get_moe_source_group() -> GroupCoordinator:
+    assert _MOE_SOURCE is not None, "moe source group is not initialized"
+    return _MOE_SOURCE
+
+
+def get_moe_peer_group() -> GroupCoordinator:
+    assert get_ascend_config().moe_parallel_config.enabled, "moe tp mode is not enabled"
+    return get_tp_group()
+
+
 def get_mlp_tp_group() -> GroupCoordinator:
     assert _MLP_TP is not None, "mlp group is not initialized"
     return _MLP_TP
@@ -289,6 +330,16 @@ def destroy_ascend_model_parallel():
     if _MC2:
         _MC2.destroy()
     _MC2 = None
+
+    global _MOE_TP
+    if _MOE_TP:
+        _MOE_TP.destroy()
+    _MOE_TP = None
+
+    global _MOE_SOURCE
+    if _MOE_SOURCE:
+        _MOE_SOURCE.destroy()
+    _MOE_SOURCE = None
 
     global _MLP_TP
     if _MLP_TP:

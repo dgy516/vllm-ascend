@@ -28,6 +28,7 @@ class MoECommType(Enum):
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
+    MOE_TP_ALLGATHER = 4
 
 
 @contextmanager
@@ -205,13 +206,15 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     device generation, token count, and quantization.
 
     1. Non-MoE models return `None`.
-    2. Without expert parallel, fall back to all-gather.
-    3. On A2 with expert parallel, pick MC2 when tokens fit the MC2 capacity
+    2. When `moe_parallel_config.mode=tensor_parallel` is enabled, use the
+       dedicated MoE-TP all-gather path.
+    3. Without expert parallel, fall back to all-gather.
+    4. On A2 with expert parallel, pick MC2 when tokens fit the MC2 capacity
        and the DP size is large enough; otherwise use all-gather.
-    4. On A3 with expert parallel, prefer fused MC2 when using w8a8_dynamic
+    5. On A3 with expert parallel, prefer fused MC2 when using w8a8_dynamic
        quantization with small EP size, no dynamic_eplb, and not in MTP
        mode; otherwise use MC2 within capacity or all-to-all.
-    5. On 310P, always use all-gather.
+    6. On 310P, always use all-gather.
 
     Args:
         num_tokens (int): The number of tokens in the current batch.
@@ -226,6 +229,13 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     """
     if not is_moe_model(vllm_config):
         return None
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    ascend_config = get_ascend_config()
+    moe_parallel_config = getattr(ascend_config, "moe_parallel_config", None)
+    if getattr(moe_parallel_config, "enabled", False) is True:
+        return MoECommType.MOE_TP_ALLGATHER
+
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     soc_version = get_ascend_device_type()
     quant_type = getattr(

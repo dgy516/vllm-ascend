@@ -36,7 +36,12 @@ from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
-from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.distributed.parallel_state import (
+    get_mc2_group,
+    get_moe_peer_group,
+    get_moe_source_group,
+    get_moe_tp_group,
+)
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
@@ -313,6 +318,13 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.mc2_group = get_mc2_group()
         self.moe_config.supports_eplb = self.quant_method.supports_eplb
         ascend_config = get_ascend_config()
+        moe_parallel_config = getattr(ascend_config, "moe_parallel_config", None)
+        self.moe_tp_mode = getattr(moe_parallel_config, "enabled", False) is True
+        if self.moe_tp_mode:
+            self.moe_config.source_tp_rank = moe_parallel_config.source_tp_rank
+            self.moe_config.moe_tp_group = get_moe_tp_group()
+            self.moe_config.moe_source_group = get_moe_source_group()
+            self.moe_config.moe_peer_group = get_moe_peer_group()
         # flashcommon3 gate stream
         self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
         if self.multistream_overlap_gate and AscendFusedMoE.gate_stream is None:
@@ -413,10 +425,11 @@ class AscendFusedMoE(FusedMoE):
 
     def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):
         """NOTE(Yizhou): This is to override the parent class method. In `mc2commimpl`,
-        and `alltoallcommimpl`, we do not need to all-reduce the final outputs since
-        the outputs are already aggregated across tensor parallel ranks in the
-        `finalize` function. In `allgathercommimpl`, we still need to all-reduce the
-        outputs since each rank only has partial outputs.
+        `alltoallcommimpl`, and `moe_tp_allgathercommimpl`, we do not need to
+        all-reduce the final outputs since the outputs are already aggregated
+        across tensor parallel ranks in the `finalize` function. In
+        `allgathercommimpl`, we still need to all-reduce the outputs since each
+        rank only has partial outputs.
         """
         return torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
 
@@ -461,7 +474,12 @@ class AscendFusedMoE(FusedMoE):
                 # NOTE: This is exactly the opposite of `maybe_all_reduce_tensor_model_parallel`
                 moe_comm_type = _EXTRA_CTX.moe_comm_type
                 if (
-                    moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
+                    moe_comm_type in {
+                        MoECommType.ALLTOALL,
+                        MoECommType.MC2,
+                        MoECommType.FUSED_MC2,
+                        MoECommType.MOE_TP_ALLGATHER,
+                    }
                     and not shared_expert_dp_enabled()
                 ):
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
@@ -711,7 +729,12 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
         # `maybe_all_reduce_tensor_model_parallel`
         moe_comm_type = _EXTRA_CTX.moe_comm_type
         if (
-            moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
+            moe_comm_type in {
+                MoECommType.ALLTOALL,
+                MoECommType.MC2,
+                MoECommType.FUSED_MC2,
+                MoECommType.MOE_TP_ALLGATHER,
+            }
             and not shared_expert_dp_enabled()
         ):
             shared_out = tensor_model_parallel_all_reduce(shared_out)
