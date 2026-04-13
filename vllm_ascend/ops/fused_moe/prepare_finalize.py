@@ -496,11 +496,13 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
         self.moe_tp_group = getattr(moe_config, "moe_tp_group", None)
         self.moe_source_group = getattr(moe_config, "moe_source_group", None)
         self.moe_source_group_world_size = getattr(moe_config, "moe_source_group_world_size", None)
+        self.moe_source_group_index = getattr(moe_config, "moe_source_group_index", None)
         self.moe_peer_group = getattr(moe_config, "moe_peer_group", None)
 
         assert self.moe_tp_group is not None, "moe_tp_group is required for MoE-TP mode."
         assert self.moe_peer_group is not None, "moe_peer_group is required for MoE-TP mode."
         assert self.moe_source_group_world_size is not None, "moe_source_group_world_size is required for MoE-TP mode."
+        assert self.moe_source_group_index is not None, "moe_source_group_index is required for MoE-TP mode."
 
     def prepare(
         self,
@@ -573,11 +575,6 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
         del reduce_results, padded_hidden_states_shape
 
         hidden_states = self.moe_tp_group.all_reduce(hidden_states)
-        if self.is_source_rank:
-            local_batch_offset = self.moe_source_group.rank_in_group * self.max_tokens_across_dp
-            hidden_states = hidden_states[local_batch_offset : local_batch_offset + self.num_tokens]
-        else:
-            hidden_states = hidden_states.new_empty((self.num_tokens, hidden_states.shape[-1]))
-
-        hidden_states = self.moe_peer_group.broadcast(hidden_states, src=self.source_tp_rank)
+        local_batch_offset = self.moe_source_group_index * self.max_tokens_across_dp
+        hidden_states = hidden_states[local_batch_offset : local_batch_offset + self.num_tokens]
         return hidden_states

@@ -327,6 +327,10 @@ class AscendFusedMoE(FusedMoE):
             self.moe_config.moe_source_group_world_size = (
                 self.moe_parallel_config.dp_size * self.moe_parallel_config.pcp_size
             )
+            self.moe_config.moe_source_group_index = (
+                self.moe_parallel_config.dp_rank * self.moe_parallel_config.pcp_size
+                + self.moe_parallel_config.pcp_rank
+            )
             if self.moe_config.moe_peer_group.rank_in_group == moe_parallel_config.source_tp_rank:
                 self.moe_config.moe_source_group = get_moe_source_group()
             else:

@@ -28,6 +28,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.moe_config.moe_tp_group = MagicMock()
         self.moe_config.moe_source_group = MagicMock()
         self.moe_config.moe_source_group_world_size = 1
+        self.moe_config.moe_source_group_index = 0
         self.moe_config.moe_peer_group = MagicMock()
         self.moe_config.source_tp_rank = 0
         self.moe_config.original_num_experts = 8
@@ -257,6 +258,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.moe_config.moe_source_group.world_size = 2
         self.moe_config.moe_source_group_world_size = 2
         self.moe_config.moe_source_group.rank_in_group = 1
+        self.moe_config.moe_source_group_index = 1
         self.moe_config.moe_peer_group.rank_in_group = 0
 
         def mock_source_all_gather(tensor, dim):
@@ -283,10 +285,10 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
         expected_global_hidden = torch.full((6, 2), 7.0)
         expected_global_router = torch.full((6, 4), 11.0)
-        expected_local_hidden = torch.full((2, 2), 23.0)
 
         self.moe_config.moe_source_group = None
         self.moe_config.moe_source_group_world_size = 2
+        self.moe_config.moe_source_group_index = 1
         self.moe_config.moe_peer_group.rank_in_group = 1
 
         def mock_peer_broadcast(tensor, src):
@@ -294,8 +296,6 @@ class TestPrepareAndFinalize(unittest.TestCase):
                 tensor.copy_(expected_global_hidden)
             elif tuple(tensor.shape) == (6, 4):
                 tensor.copy_(expected_global_router)
-            elif tuple(tensor.shape) == (2, 2):
-                tensor.copy_(expected_local_hidden)
             return tensor
 
         self.moe_config.moe_peer_group.broadcast = mock_peer_broadcast
@@ -310,7 +310,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.assertTrue(torch.equal(prepare_output.router_logits, expected_global_router))
 
         result = layer.finalize(prepare_output.hidden_states, reduce_results=True)
-        self.assertTrue(torch.equal(result, expected_local_hidden))
+        self.assertTrue(torch.equal(result, expected_global_hidden[3:5] + 5))
 
     @patch("torch_npu.npu_dynamic_quant")
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize._EXTRA_CTX")
@@ -324,6 +324,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.moe_config.moe_source_group.world_size = 2
         self.moe_config.moe_source_group_world_size = 2
         self.moe_config.moe_source_group.rank_in_group = 0
+        self.moe_config.moe_source_group_index = 0
         self.moe_config.moe_peer_group.rank_in_group = 0
 
         def mock_source_all_gather(tensor, dim):
@@ -355,6 +356,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
         self.moe_config.moe_source_group = None
         self.moe_config.moe_source_group_world_size = 2
+        self.moe_config.moe_source_group_index = 1
         self.moe_config.moe_peer_group.rank_in_group = 1
 
         def mock_peer_broadcast(tensor, src):

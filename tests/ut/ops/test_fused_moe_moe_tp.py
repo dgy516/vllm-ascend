@@ -132,6 +132,7 @@ class TestAscendFusedMoEMoeTP(TestBase):
         self.assertIs(moe.moe_config.moe_peer_group, moe_peer_group)
         self.assertIsNone(moe.moe_config.moe_source_group)
         self.assertEqual(moe.moe_config.moe_source_group_world_size, 4)
+        self.assertEqual(moe.moe_config.moe_source_group_index, 1)
         self.assertEqual(moe.moe_config.source_tp_rank, 0)
         mock_get_moe_source_group.assert_not_called()
         mock_setup_moe_comm_method.assert_called_once_with(moe.moe_config)
