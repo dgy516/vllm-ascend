@@ -124,7 +124,8 @@ def init_ascend_model_parallel(
         _MOE_TP = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="moe_tp")
 
         moe_source_group_ranks = (
-            all_ranks.permute(0, 2, 4, 1, 3)
+            all_ranks[..., moe_parallel_config.source_tp_rank]
+            .transpose(1, 2)
             .reshape(
                 -1,
                 global_dp_size * global_pcp_size,
@@ -134,7 +135,7 @@ def init_ascend_model_parallel(
         moe_source_group_ranks = [x.tolist() for x in moe_source_group_ranks]
 
         global _MOE_SOURCE
-        _MOE_SOURCE = init_model_parallel_group(
+        _MOE_SOURCE = init_optional_model_parallel_group(
             moe_source_group_ranks,
             get_world_group().local_rank,
             backend,

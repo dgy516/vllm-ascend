@@ -153,14 +153,14 @@ def test_init_ascend_model_parallel_with_moe_tp(mock_distributed):
         assert moe_source_group is created_groups["moe_source"][0]
         assert moe_peer_group is not None
         assert created_groups["moe_tp"][1] == [[0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15]]
-        assert created_groups["moe_source"][1] == [[0, 2, 4, 6], [1, 3, 5, 7], [8, 10, 12, 14], [9, 11, 13, 15]]
+        assert created_groups["moe_source"][1] == [[0, 2, 4, 6], [8, 10, 12, 14]]
 
         destroy_ascend_model_parallel()
         assert parallel_state._MOE_TP is None
         assert parallel_state._MOE_SOURCE is None
 
 
-def test_init_ascend_model_parallel_with_moe_tp_peer_rank_builds_tp_rank_source_group():
+def test_init_ascend_model_parallel_with_moe_tp_peer_rank_builds_non_member_source_group():
     parallel_config = ParallelConfig(
         data_parallel_size=4,
         tensor_parallel_size=2,
@@ -225,8 +225,8 @@ def test_init_ascend_model_parallel_with_moe_tp_peer_rank_builds_tp_rank_source_
         init_ascend_model_parallel(parallel_config)
 
         assert get_moe_tp_group() is created_groups["moe_tp"][0]
-        assert get_moe_source_group() is created_groups["moe_source"][0]
-        assert created_groups["moe_source"][1] == [[0, 2, 4, 6], [1, 3, 5, 7], [8, 10, 12, 14], [9, 11, 13, 15]]
+        assert parallel_state._MOE_SOURCE is created_groups["moe_source"][0]
+        assert created_groups["moe_source"][1] == [[0, 2, 4, 6], [8, 10, 12, 14]]
 
         destroy_ascend_model_parallel()
         assert parallel_state._MOE_TP is None
