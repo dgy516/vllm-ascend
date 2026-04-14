@@ -359,6 +359,19 @@ class TestTokenDispatcherWithAllGather(TestBase):
         self.mock_npu_moe_token_unpermute.assert_called_once()
         self.assertEqual(final_hidden_states.shape, (6, 128))
 
+    def test_token_combine_casts_sorted_indices_to_int32(self):
+        hidden_states = torch.randn(6, 128)
+        combine_metadata = MoEAllGatherCombineMetadata(
+            expanded_row_idx=torch.tensor([0, 1, 1, 1, 1, 1], dtype=torch.int64),
+            topk_weights=torch.tensor([0.5, 0.5, 0.5, 0.5, 0.5, 0.5]),
+            restore_shape=torch.Size([6, 128]),
+        )
+
+        self.dispatcher.token_combine(hidden_states, combine_metadata)
+
+        kwargs = self.mock_npu_moe_token_unpermute.call_args.kwargs
+        self.assertEqual(kwargs["sorted_indices"].dtype, torch.int32)
+
     @pytest.mark.skip(
         "Skip as register_kernels has NPU SocName checking in CANN 8.5.0.")
     def test_token_dispatch_with_router_weight(self):

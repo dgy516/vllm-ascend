@@ -356,6 +356,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.assertEqual(prepare_output.router_logits.shape, torch.Size([0, 4]))
         self.assertEqual(mock_extra_ctx.moe_tp_topk_weights.shape, torch.Size([8, 2]))
         self.assertEqual(mock_extra_ctx.moe_tp_topk_ids.shape, torch.Size([8, 2]))
+        self.assertEqual(mock_extra_ctx.moe_tp_topk_ids.dtype, torch.int32)
 
     @patch("torch_npu.npu_dynamic_quant")
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize._EXTRA_CTX")

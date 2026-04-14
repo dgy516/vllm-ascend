@@ -366,6 +366,7 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
         mock_select_experts.assert_not_called()
         fused_experts_input = mock_comm.fused_experts.call_args.kwargs["fused_experts_input"]
         self.assertIs(fused_experts_input.topk_weights, topk_weights)
-        self.assertIs(fused_experts_input.topk_ids, topk_ids)
+        self.assertEqual(fused_experts_input.topk_ids.dtype, torch.int32)
+        self.assertTrue(torch.equal(fused_experts_input.topk_ids, topk_ids.to(torch.int32)))
         self.assertIsNone(mock_extra_ctx.moe_tp_topk_weights)
         self.assertIsNone(mock_extra_ctx.moe_tp_topk_ids)

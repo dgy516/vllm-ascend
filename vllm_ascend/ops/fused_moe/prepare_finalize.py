@@ -563,6 +563,8 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
                 if should_precompute_routing:
                     local_topk_weights = self._pad_along_first_dim(local_topk_weights, pad_size)
                     local_topk_ids = self._pad_along_first_dim(local_topk_ids, pad_size)
+            if should_precompute_routing and local_topk_ids.dtype != torch.int32:
+                local_topk_ids = local_topk_ids.to(torch.int32)
 
             hidden_states = self.moe_source_group.all_gather(hidden_states, 0)
             if should_precompute_routing:
@@ -582,18 +584,18 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
             router_logits = router_logits.new_empty((global_num_tokens, router_logits.shape[-1]))
             if quant_type == QuantType.W8A8:
                 pertoken_scale = torch.empty((global_num_tokens,), device=hidden_states.device, dtype=torch.float32)
-            if should_precompute_routing:
-                _EXTRA_CTX.moe_tp_topk_weights = torch.empty(
-                    (global_num_tokens, self.moe_config.experts_per_token),
-                    device=hidden_states.device,
-                    dtype=torch.float32,
-                )
-                _EXTRA_CTX.moe_tp_topk_ids = torch.empty(
-                    (global_num_tokens, self.moe_config.experts_per_token),
-                    device=hidden_states.device,
-                    dtype=torch.int64,
-                )
-                router_logits = router_logits.new_empty((0, router_logits.shape[-1]))
+                if should_precompute_routing:
+                    _EXTRA_CTX.moe_tp_topk_weights = torch.empty(
+                        (global_num_tokens, self.moe_config.experts_per_token),
+                        device=hidden_states.device,
+                        dtype=torch.float32,
+                    )
+                    _EXTRA_CTX.moe_tp_topk_ids = torch.empty(
+                        (global_num_tokens, self.moe_config.experts_per_token),
+                        device=hidden_states.device,
+                        dtype=torch.int32,
+                    )
+                    router_logits = router_logits.new_empty((0, router_logits.shape[-1]))
 
         hidden_states = self.moe_peer_group.broadcast(hidden_states, src=self.source_tp_rank)
         if router_logits.numel() > 0:
