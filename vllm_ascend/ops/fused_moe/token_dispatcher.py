@@ -313,6 +313,8 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         hidden_states = token_dispatch_input.hidden_states
         topk_weights = token_dispatch_input.topk_weights
         topk_ids = token_dispatch_input.topk_ids
+        if topk_ids.dtype != torch.int32:
+            topk_ids = topk_ids.to(torch.int32)
         expert_map = token_dispatch_input.routing.expert_map
         pertoken_scale = token_dispatch_input.routing.pertoken_scale
         global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
@@ -364,7 +366,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
     def token_combine(self, hidden_states, combine_metadata, bias=None):
         final_hidden_states = torch_npu.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,
-            sorted_indices=torch.abs(combine_metadata.expanded_row_idx),
+            sorted_indices=torch.abs(combine_metadata.expanded_row_idx).to(torch.int32),
             probs=combine_metadata.topk_weights,
         )
         if len(combine_metadata.restore_shape) == 3:

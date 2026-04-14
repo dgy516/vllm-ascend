@@ -252,6 +252,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 topk_ids.size(0), global_num_experts - global_redundant_expert_num, device=topk_ids.device
             )
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
+        if topk_ids.dtype != torch.int32:
+            topk_ids = topk_ids.to(torch.int32)
 
         assert topk_weights is not None
         topk_weights = topk_weights.to(self.in_dtype)
