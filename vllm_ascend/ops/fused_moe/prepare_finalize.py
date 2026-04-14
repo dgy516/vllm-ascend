@@ -487,8 +487,8 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
     Phase 1 canonicalizes MoE inputs by selecting a single source TP rank inside
     each DP replica, gathering unique inputs across the source ranks, then
     broadcasting the global batch to the paired TP peer. Final outputs are
-    reduced on the dedicated MoE-TP group before each source rank slices its
-    local DP batch and broadcasts it back to the TP peer.
+    reduced chunk-by-chunk onto the matching source ranks so we do not
+    materialize the fully reduced global batch on every TP shard.
     """
 
     def __init__(self, moe_config: FusedMoEConfig):
@@ -629,8 +629,33 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
         padded_hidden_states_shape: torch.Size | None = None,
     ) -> torch.Tensor:
         del reduce_results, padded_hidden_states_shape
+        local_hidden_states = None
+        for source_group_index in range(self.moe_source_group_world_size):
+            batch_offset = source_group_index * self.max_tokens_across_dp
+            batch_end = batch_offset + self.max_tokens_across_dp
+            source_hidden_states = hidden_states[batch_offset:batch_end]
+            source_hidden_states = self._reduce_to_source_rank(source_hidden_states, source_group_index)
+            if self.is_source_rank and source_group_index == self.moe_source_group_index:
+                local_hidden_states = source_hidden_states[: self.num_tokens]
 
-        hidden_states = self.moe_tp_group.all_reduce(hidden_states)
-        local_batch_offset = self.moe_source_group_index * self.max_tokens_across_dp
-        hidden_states = hidden_states[local_batch_offset : local_batch_offset + self.num_tokens]
+        if local_hidden_states is None:
+            local_hidden_states = torch.empty(
+                (self.num_tokens, hidden_states.shape[-1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+
+        return self.moe_peer_group.broadcast(local_hidden_states, src=self.source_tp_rank)
+
+    def _reduce_to_source_rank(self, hidden_states: torch.Tensor, source_group_index: int) -> torch.Tensor:
+        if self.moe_tp_group.world_size == 1:
+            return hidden_states
+
+        source_rank = source_group_index * self.moe_peer_group.world_size + self.source_tp_rank
+        assert source_rank < len(self.moe_tp_group.ranks), "source rank is out of range for moe_tp_group."
+        torch.distributed.reduce(
+            hidden_states,
+            dst=self.moe_tp_group.ranks[source_rank],
+            group=self.moe_tp_group.device_group,
+        )
         return hidden_states
