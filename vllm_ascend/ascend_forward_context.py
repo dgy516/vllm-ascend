@@ -75,6 +75,8 @@ def set_ascend_forward_context(
 
         forward_context.moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
+        forward_context.moe_tp_topk_weights = None
+        forward_context.moe_tp_topk_ids = None
 
         tp_world_size = get_tensor_model_parallel_world_size()
 
@@ -317,6 +319,8 @@ class _ExtraForwardContextProxy:
         "num_accept_tokens",
         "in_profile_run",
         "padded_num_tokens",
+        "moe_tp_topk_weights",
+        "moe_tp_topk_ids",
     )
 
     def check_extra_attr(self, name: str):

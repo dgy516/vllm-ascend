@@ -13,7 +13,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from vllm.config import VllmConfig
 
@@ -212,5 +212,32 @@ class TestAscendConfig(TestBase):
         with self.assertRaisesRegex(
             ValueError,
             "moe_parallel_config.mode=tensor_parallel does not support multistream_overlap_gate.",
+        ):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.utils.enable_sp", return_value=False)
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_init_ascend_config_rejects_moe_parallel_with_mtp(
+        self, mock_fix_incompatible_config, mock_enable_sp
+    ):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.parallel_config.data_parallel_size = 4
+        test_vllm_config.parallel_config.tensor_parallel_size = 2
+        test_vllm_config.parallel_config.prefill_context_parallel_size = 1
+        test_vllm_config.parallel_config.enable_expert_parallel = False
+        test_vllm_config.speculative_config = MagicMock(method="deepseek_mtp")
+        test_vllm_config.additional_config = {
+            "moe_parallel_config": {
+                "mode": "tensor_parallel",
+                "moe_tensor_parallel_size": 8,
+                "source_tp_rank": 0,
+            },
+            "refresh": True,
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "moe_parallel_config.mode=tensor_parallel does not support MTP speculative decoding.",
         ):
             init_ascend_config(test_vllm_config)

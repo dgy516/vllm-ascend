@@ -189,8 +189,12 @@ class AscendConfig:
             return
 
         parallel_config = self.vllm_config.parallel_config
+        speculative_config = self.vllm_config.speculative_config
+        speculative_method = getattr(speculative_config, "method", None)
         if parallel_config.enable_expert_parallel:
             raise ValueError("moe_parallel_config.mode=tensor_parallel requires enable_expert_parallel=False.")
+        if isinstance(speculative_method, str) and "mtp" in speculative_method:
+            raise ValueError("moe_parallel_config.mode=tensor_parallel does not support MTP speculative decoding.")
         if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
             raise ValueError("moe_parallel_config.mode=tensor_parallel is incompatible with shared expert DP.")
         if self.multistream_overlap_gate:
