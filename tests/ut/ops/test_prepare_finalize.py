@@ -326,7 +326,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         quant_hidden_states = torch.full((3, 2), 5, dtype=torch.int8)
         quant_scales = torch.full((3,), 0.25, dtype=torch.float32)
         mock_dynamic_quant.return_value = (quant_hidden_states, quant_scales)
-        local_topk_weights = torch.full((3, 2), 0.5, dtype=torch.float32)
+        local_topk_weights = torch.full((3, 2), 0.5, dtype=torch.bfloat16)
         local_topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int64)
         mock_select_experts.return_value = (local_topk_weights, local_topk_ids)
 
@@ -355,6 +355,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         self.assertEqual(prepare_output.pertoken_scale.shape, torch.Size([8]))
         self.assertEqual(prepare_output.router_logits.shape, torch.Size([0, 4]))
         self.assertEqual(mock_extra_ctx.moe_tp_topk_weights.shape, torch.Size([8, 2]))
+        self.assertEqual(mock_extra_ctx.moe_tp_topk_weights.dtype, torch.float32)
         self.assertEqual(mock_extra_ctx.moe_tp_topk_ids.shape, torch.Size([8, 2]))
         self.assertEqual(mock_extra_ctx.moe_tp_topk_ids.dtype, torch.int32)
 

@@ -563,6 +563,8 @@ class PrepareAndFinalizeWithMoETPAllGather(PrepareAndFinalize):
                 if should_precompute_routing:
                     local_topk_weights = self._pad_along_first_dim(local_topk_weights, pad_size)
                     local_topk_ids = self._pad_along_first_dim(local_topk_ids, pad_size)
+            if should_precompute_routing and local_topk_weights.dtype != torch.float32:
+                local_topk_weights = local_topk_weights.to(torch.float32)
             if should_precompute_routing and local_topk_ids.dtype != torch.int32:
                 local_topk_ids = local_topk_ids.to(torch.int32)
 
