@@ -103,6 +103,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
+    # Maximum number of shared-memory broadcast chunks used by patched
+    # distributed message queues on Ascend. Larger values trade memory for
+    # fewer "No available shared memory broadcast block" stalls during heavy
+    # multiprocess traffic.
+    "VLLM_ASCEND_MQ_MAX_CHUNKS": lambda: int(os.getenv("VLLM_ASCEND_MQ_MAX_CHUNKS", "32")),
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))

@@ -18,11 +18,17 @@
 
 import torch
 import vllm
+import vllm.envs as vllm_envs
 from torch.distributed import Backend
 from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
 from vllm_ascend.utils import create_hccl_pg_options
+
+
+def _get_mq_broadcast_config() -> tuple[int, int]:
+    return vllm_envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024, envs_ascend.VLLM_ASCEND_MQ_MAX_CHUNKS
 
 
 class GroupCoordinatorPatch(GroupCoordinator):
@@ -91,7 +97,37 @@ class GroupCoordinatorPatch(GroupCoordinator):
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
         if use_message_queue_broadcaster and self.world_size > 1:
-            self.mq_broadcaster = MessageQueue.create_from_process_group(self.cpu_group, 1 << 22, 6)
+            max_chunk_bytes, max_chunks = _get_mq_broadcast_config()
+            self.mq_broadcaster = MessageQueue.create_from_process_group(
+                self.cpu_group,
+                max_chunk_bytes,
+                max_chunks,
+            )
+
+    def create_mq_broadcaster(self, writer_rank=0, external_writer_handle=None, blocking=True):
+        from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+
+        max_chunk_bytes, max_chunks = _get_mq_broadcast_config()
+        return MessageQueue.create_from_process_group(
+            self.cpu_group,
+            max_chunk_bytes,
+            max_chunks,
+            writer_rank=writer_rank,
+            external_writer_handle=external_writer_handle,
+            blocking=blocking,
+        )
+
+    def create_single_reader_mq_broadcasters(self, reader_rank_in_group=0, blocking=False):
+        from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+
+        max_chunk_bytes, max_chunks = _get_mq_broadcast_config()
+        return MessageQueue.create_from_process_group_single_reader(
+            self.cpu_group,
+            max_chunk_bytes,
+            max_chunks,
+            reader_rank=self.ranks[reader_rank_in_group],
+            blocking=blocking,
+        )
 
     def all_to_all(
         self,

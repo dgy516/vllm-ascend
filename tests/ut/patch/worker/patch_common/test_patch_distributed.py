@@ -138,3 +138,74 @@ class TestPatchDistributed(TestBase):
         self.assertFalse(hasattr(group, "cpu_group"))
         self.assertFalse(hasattr(group, "device_group"))
         self.assertEqual(mock_new_group.call_count, 2)
+
+    @patch("vllm.distributed.device_communicators.shm_broadcast.MessageQueue.create_from_process_group")
+    @patch("vllm_ascend.patch.worker.patch_distributed.envs_ascend")
+    @patch("vllm_ascend.patch.worker.patch_distributed.vllm_envs")
+    def test_message_queue_broadcaster_uses_configured_capacity(
+        self,
+        mock_vllm_envs,
+        mock_envs_ascend,
+        mock_create_from_process_group,
+    ):
+        mock_vllm_envs.VLLM_MQ_MAX_CHUNK_BYTES_MB = 32
+        mock_envs_ascend.VLLM_ASCEND_MQ_MAX_CHUNKS = 24
+
+        group = GroupCoordinatorPatch(
+            group_ranks=self.mock_group_ranks,
+            local_rank=self.mock_local_rank,
+            torch_distributed_backend=self.mock_backend,
+            use_device_communicator=self.mock_use_device_comm,
+            use_message_queue_broadcaster=True,
+        )
+
+        mock_create_from_process_group.assert_called_once_with(
+            group.cpu_group,
+            32 * 1024 * 1024,
+            24,
+        )
+
+    @patch("vllm.distributed.device_communicators.shm_broadcast.MessageQueue.create_from_process_group")
+    @patch("vllm_ascend.patch.worker.patch_distributed.envs_ascend")
+    @patch("vllm_ascend.patch.worker.patch_distributed.vllm_envs")
+    def test_create_mq_broadcaster_uses_configured_capacity(
+        self,
+        mock_vllm_envs,
+        mock_envs_ascend,
+        mock_create_from_process_group,
+    ):
+        mock_vllm_envs.VLLM_MQ_MAX_CHUNK_BYTES_MB = 8
+        mock_envs_ascend.VLLM_ASCEND_MQ_MAX_CHUNKS = 12
+
+        self.group_coordinator.create_mq_broadcaster(writer_rank=1, external_writer_handle="h", blocking=False)
+
+        mock_create_from_process_group.assert_called_once_with(
+            self.group_coordinator.cpu_group,
+            8 * 1024 * 1024,
+            12,
+            writer_rank=1,
+            external_writer_handle="h",
+            blocking=False,
+        )
+
+    @patch("vllm.distributed.device_communicators.shm_broadcast.MessageQueue.create_from_process_group_single_reader")
+    @patch("vllm_ascend.patch.worker.patch_distributed.envs_ascend")
+    @patch("vllm_ascend.patch.worker.patch_distributed.vllm_envs")
+    def test_create_single_reader_broadcaster_uses_configured_capacity(
+        self,
+        mock_vllm_envs,
+        mock_envs_ascend,
+        mock_create_single_reader,
+    ):
+        mock_vllm_envs.VLLM_MQ_MAX_CHUNK_BYTES_MB = 4
+        mock_envs_ascend.VLLM_ASCEND_MQ_MAX_CHUNKS = 20
+
+        self.group_coordinator.create_single_reader_mq_broadcasters(reader_rank_in_group=0, blocking=True)
+
+        mock_create_single_reader.assert_called_once_with(
+            self.group_coordinator.cpu_group,
+            4 * 1024 * 1024,
+            20,
+            reader_rank=self.group_coordinator.ranks[0],
+            blocking=True,
+        )
