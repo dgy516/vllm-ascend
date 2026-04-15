@@ -21,7 +21,11 @@ import torch
 
 from vllm_ascend.distributed import parallel_state
 from vllm_ascend.ops.vocab_parallel_embedding import (
-    AscendLogitsProcessor, AscendParallelLMHead, AscendVocabParallelEmbedding)
+    AscendLogitsProcessor,
+    AscendParallelLMHead,
+    AscendUnquantizedLMHeadMethod,
+    AscendVocabParallelEmbedding,
+)
 
 VOCAB_PARALLEL_EMBEDDING_TEST_NUM_RANDOM_SEEDS = 128
 
@@ -376,3 +380,89 @@ class TestAscendLogitsProcessor(unittest.TestCase):
             bias=None,
         )
         self.assertEqual(group.all_gather.call_count, 2)
+
+
+class TestAscendParallelLMHeadNZ(unittest.TestCase):
+
+    def setUp(self):
+        self.mock_group = MagicMock()
+        self.mock_group.world_size = 1
+        self.mock_group.rank_in_group = 0
+        self.patches = [
+            patch(
+                "vllm_ascend.ops.vocab_parallel_embedding.get_tp_group",
+                return_value=self.mock_group,
+            ),
+            patch(
+                "vllm_ascend.ops.vocab_parallel_embedding.get_lmhead_tp_group",
+                return_value=self.mock_group,
+            ),
+            patch(
+                "vllm_ascend.ops.vocab_parallel_embedding.lmhead_tp_enable",
+                return_value=False,
+            ),
+            patch(
+                "vllm_ascend.ops.vocab_parallel_embedding.embedding_tp_enable",
+                return_value=False,
+            ),
+        ]
+        for patcher in self.patches:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in self.patches:
+            patcher.stop()
+
+    def test_parallel_lm_head_uses_unquantized_lmhead_method(self):
+        lmhead = AscendParallelLMHead(
+            num_embeddings=32,
+            embedding_dim=16,
+            prefix="lm_head",
+        )
+        embedding = AscendVocabParallelEmbedding(
+            num_embeddings=32,
+            embedding_dim=16,
+            prefix="embed_tokens",
+        )
+
+        self.assertIsInstance(lmhead.quant_method, AscendUnquantizedLMHeadMethod)
+        self.assertNotIsInstance(embedding.quant_method, AscendUnquantizedLMHeadMethod)
+
+    @patch("vllm_ascend.ops.vocab_parallel_embedding.maybe_trans_nz")
+    def test_parallel_lm_head_process_weights_after_loading_builds_weight_nz(
+        self,
+        mock_trans_nz,
+    ):
+        lmhead = AscendParallelLMHead(
+            num_embeddings=32,
+            embedding_dim=16,
+            prefix="lm_head",
+        )
+        sentinel_weight = torch.randn_like(lmhead.weight)
+        mock_trans_nz.return_value = sentinel_weight
+
+        lmhead.quant_method.process_weights_after_loading(lmhead)
+
+        mock_trans_nz.assert_called_once_with(lmhead.weight)
+        self.assertIs(lmhead.weight_nz, sentinel_weight)
+
+    @patch("vllm_ascend.ops.vocab_parallel_embedding.dispatch_unquantized_gemm")
+    def test_parallel_lm_head_apply_prefers_weight_nz(self, mock_dispatch_gemm):
+        gemm_impl = MagicMock(return_value=torch.randn(2, 32))
+        mock_dispatch_gemm.return_value = gemm_impl
+        lmhead = AscendParallelLMHead(
+            num_embeddings=32,
+            embedding_dim=16,
+            prefix="lm_head",
+        )
+        lmhead.weight_nz = torch.randn_like(lmhead.weight)
+        hidden_states = torch.randn(2, 16)
+
+        lmhead.quant_method.apply(lmhead, hidden_states)
+
+        gemm_impl.assert_called_once_with(
+            lmhead,
+            hidden_states,
+            lmhead.weight_nz,
+            None,
+        )

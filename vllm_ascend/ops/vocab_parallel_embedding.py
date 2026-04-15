@@ -27,6 +27,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -37,7 +38,26 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_ascend.distributed.parallel_state import get_embed_tp_group, get_lmhead_tp_group
-from vllm_ascend.utils import embedding_tp_enable, lmhead_tp_enable
+from vllm_ascend.utils import embedding_tp_enable, lmhead_tp_enable, maybe_trans_nz
+
+
+class AscendUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        layer.weight_nz = maybe_trans_nz(layer.weight)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return dispatch_unquantized_gemm()(
+            layer,
+            x,
+            getattr(layer, "weight_nz", layer.weight),
+            bias,
+        )
 
 
 class AscendVocabParallelEmbedding(VocabParallelEmbedding):
@@ -94,6 +114,12 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
+
+        if (
+            isinstance(self, ParallelLMHead)
+            and type(quant_method) is UnquantizedEmbeddingMethod
+        ):
+            quant_method = AscendUnquantizedLMHeadMethod()
 
         # If we are making an embedding layer, then our quantization linear
         # method must implement the embedding operation. If we are another
