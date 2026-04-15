@@ -116,6 +116,7 @@ from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.rejection_sampler import greedy_rejection_sample
 from vllm_ascend.sample.sampler import AscendSampler
+from vllm_ascend.sample.top_tokens import get_greedy_top_tokens
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
@@ -1759,18 +1760,7 @@ class NPUModelRunner(GPUModelRunner):
         expected_num_tokens: int | None = None,
     ) -> torch.Tensor:
         assert self.model is not None
-        if hasattr(self.model, "get_top_tokens"):
-            top_tokens = self.model.get_top_tokens(sample_hidden_states)
-        elif hasattr(self.model, "logits_processor") and hasattr(self.model, "lm_head"):
-            embedding_bias = getattr(self.model.lm_head, "bias", None)
-            top_tokens = self.model.logits_processor.get_top_tokens(
-                self.model.lm_head,
-                sample_hidden_states,
-                embedding_bias,
-            )
-        else:
-            logits = self.model.compute_logits(sample_hidden_states)
-            top_tokens = logits.argmax(dim=-1)
+        top_tokens = get_greedy_top_tokens(self.model, sample_hidden_states)
 
         if expected_num_tokens is None:
             expected_num_tokens = self.input_batch.num_reqs

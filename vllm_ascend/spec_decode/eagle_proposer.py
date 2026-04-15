@@ -46,6 +46,7 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.sample.top_tokens import get_greedy_top_tokens
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
@@ -169,6 +170,28 @@ class SpecDecodeBaseProposer(EagleProposer):
             self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int32, device=device)
 
         self.token_arange_np = np.arange(self.max_num_tokens + 1)
+
+    def _get_top_tokens_for_model(
+        self,
+        sample_hidden_states: torch.Tensor,
+        expected_num_tokens: int | None = None,
+    ) -> torch.Tensor:
+        top_tokens = get_greedy_top_tokens(self.model, sample_hidden_states)
+
+        if expected_num_tokens is not None and top_tokens.shape[0] > expected_num_tokens:
+            top_tokens = top_tokens[:expected_num_tokens]
+        return top_tokens
+
+    def _greedy_sample(
+        self,
+        hidden_states: torch.Tensor,
+        expected_num_tokens: int | None = None,
+    ) -> torch.Tensor:
+        """Greedy-sample draft tokens from hidden states."""
+        return self._get_top_tokens_for_model(
+            hidden_states,
+            expected_num_tokens=expected_num_tokens,
+        )
 
     def _get_model(self) -> nn.Module:
         """
@@ -781,13 +804,13 @@ class SpecDecodeBaseProposer(EagleProposer):
             )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
-        logits = self.model.compute_logits(sample_hidden_states)
+        draft_token_ids = self._greedy_sample(
+            sample_hidden_states,
+            expected_num_tokens=num_indices,
+        )
 
-        if lmhead_tp_enable() and num_indices < logits.shape[0]:
-            logits = logits[:num_indices]
+        if lmhead_tp_enable() and num_indices < token_indices_to_sample.shape[0]:
             token_indices_to_sample = token_indices_to_sample[:num_indices]
-
-        draft_token_ids = logits.argmax(dim=-1)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -795,7 +818,6 @@ class SpecDecodeBaseProposer(EagleProposer):
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.pcp_size * self.dcp_size > 1 and is_prefill:
-            draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list = []
             for _ in range(self.num_speculative_tokens):
                 draft_token_ids_list.append(draft_token_ids)
@@ -906,15 +928,16 @@ class SpecDecodeBaseProposer(EagleProposer):
                 )
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
-            logits = self.model.compute_logits(sample_hidden_states)
+            draft_token_ids = self._greedy_sample(
+                sample_hidden_states,
+                expected_num_tokens=num_indices,
+            )
 
-            if lmhead_tp_enable() and num_indices < logits.shape[0]:
-                logits = logits[:num_indices]
+            if lmhead_tp_enable() and num_indices < token_indices_to_sample.shape[0]:
                 token_indices_to_sample = token_indices_to_sample[:num_indices]
 
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
 
         # [batch_size, num_speculative_tokens]

@@ -226,6 +226,56 @@ class TestNPUModelRunnerGreedyFastPath(unittest.TestCase):
         )
         logits_processor.get_top_tokens.assert_called_once()
 
+    def test_get_top_tokens_for_model_uses_language_model_from_wrapper(self):
+        runner = self._build_runner()
+        logits_processor = MagicMock()
+        logits_processor.get_top_tokens.return_value = torch.tensor(
+            [4, 5, 6],
+            dtype=torch.int64,
+        )
+        language_model = SimpleNamespace(
+            logits_processor=logits_processor,
+            lm_head=SimpleNamespace(bias=None),
+        )
+        runner.model = SimpleNamespace(
+            get_language_model=MagicMock(return_value=language_model),
+            compute_logits=MagicMock(),
+        )
+
+        top_tokens = runner._get_top_tokens_for_model(torch.randn(2, 4))
+
+        torch.testing.assert_close(
+            top_tokens,
+            torch.tensor([4, 5], dtype=torch.int64),
+        )
+        runner.model.get_language_model.assert_called_once()
+        logits_processor.get_top_tokens.assert_called_once()
+        runner.model.compute_logits.assert_not_called()
+
+    def test_get_top_tokens_for_model_preserves_remapped_compute_logits(self):
+        runner = self._build_runner()
+        logits_processor = MagicMock()
+        runner.model = SimpleNamespace(
+            draft_id_to_target_id=torch.tensor([1, 2], dtype=torch.int32),
+            logits_processor=logits_processor,
+            lm_head=SimpleNamespace(bias=None),
+            compute_logits=MagicMock(
+                return_value=torch.tensor(
+                    [[1.0, 9.0, 2.0], [5.0, 4.0, 6.0]],
+                    dtype=torch.float32,
+                )
+            ),
+        )
+
+        top_tokens = runner._get_top_tokens_for_model(torch.randn(2, 4))
+
+        torch.testing.assert_close(
+            top_tokens,
+            torch.tensor([1, 2], dtype=torch.int64),
+        )
+        runner.model.compute_logits.assert_called_once()
+        logits_processor.get_top_tokens.assert_not_called()
+
     def test_build_spec_greedy_sampler_output_uses_target_and_bonus_indices(self):
         runner = self._build_runner()
         metadata = SpecDecodeMetadata(
