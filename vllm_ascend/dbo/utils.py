@@ -28,8 +28,10 @@ def select_dbo_templates(vllm_config):
             return GlmMoeDsaAlltoallTemplate()
         else:
             return GlmMoeDsaAllgatherTemplate()
-    elif "Qwen3MoeForCausalLM" in architectures:
-        # qwen MoE model
+    elif "Qwen3MoeForCausalLM" in architectures or "Qwen3_5MoeForCausalLM" in architectures:
+        # Qwen3 and Qwen3.5 MoE models share the same hook topology:
+        # attention pre-communication is exposed through column hooks and
+        # MoE overlap is handled by the common moe_prepare/moe_finalize hooks.
         if soc_version in {AscendDeviceType.A3}:
             return QwenMoEAlltoallTemplate()
         else:
@@ -46,8 +48,10 @@ def select_dbo_templates(vllm_config):
             return BailingMoEV25AlltoallTemplate()
         else:
             return BailingMoEV25AllgatherTemplate()
-    elif "Qwen3ForCausalLM" in architectures:
-        # qwen dense model
+    elif "Qwen3ForCausalLM" in architectures or "Qwen3_5ForCausalLM" in architectures:
+        # Qwen3.5 dense reuses the Qwen dense DBO policy because its hybrid
+        # attention variants still surface TP communication through the same
+        # column/row hook pair used by the existing dense template.
         if soc_version in {AscendDeviceType.A3}:
             return QwenDenseAlltoallTemplate()
         else:
