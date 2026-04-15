@@ -255,6 +255,59 @@ class AscendLogitsProcessor(LogitsProcessor):
         else:
             return self._get_logits_normal(hidden_states, lm_head, embedding_bias)
 
+    def get_top_tokens(
+        self,
+        lm_head: AscendParallelLMHead,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without gathering full logits."""
+        if self.scale <= 0.0 and self.scale != 1.0:
+            raise ValueError(
+                "The local argmax reduction optimization is not supported for "
+                "non-positive logit scaling factors."
+            )
+        if lmhead_tp_enable():
+            return self._get_top_tokens_lmheadtp(
+                hidden_states,
+                lm_head,
+                embedding_bias,
+            )
+        return self._get_top_tokens_normal(hidden_states, lm_head, embedding_bias)
+
+    def _apply_logits_postprocess(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
+        return logits
+
+    @staticmethod
+    def _get_top_tokens_from_local_logits(
+        local_logits: torch.Tensor,
+        vocab_start: int,
+        num_pad: int,
+        group,
+    ) -> torch.Tensor:
+        if num_pad > 0:
+            local_logits[..., -num_pad:] = -float("inf")
+
+        local_max_vals, local_max_indices = local_logits.max(dim=-1)
+        global_indices = local_max_indices + vocab_start
+
+        if group.world_size == 1:
+            return global_indices.to(torch.int64)
+
+        local_pair = torch.stack(
+            [local_max_vals.float(), global_indices.float()],
+            dim=-1,
+        )
+        gathered = group.all_gather(local_pair, dim=-1)
+        gathered = gathered.view(local_logits.shape[0], group.world_size, 2)
+        max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+        top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
+        return top_tokens.squeeze(-1).to(torch.int64)
+
     def _get_logits_lmheadtp(
         self,
         hidden_states: torch.Tensor,
@@ -271,6 +324,33 @@ class AscendLogitsProcessor(LogitsProcessor):
             logits = logits[..., : self.org_vocab_size]
         return logits
 
+    def _get_top_tokens_lmheadtp(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: AscendParallelLMHead,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        group = get_lmhead_tp_group()
+        local_bs = hidden_states.shape[0]
+        gathered_hidden_states = group.all_gather(hidden_states, dim=0)
+        local_logits = lm_head.quant_method.apply(
+            lm_head,
+            gathered_hidden_states,
+            bias=embedding_bias,
+        )
+        local_logits = self._apply_logits_postprocess(local_logits)
+        top_tokens = self._get_top_tokens_from_local_logits(
+            local_logits,
+            lm_head.shard_indices.org_vocab_start_index,
+            lm_head.shard_indices.num_org_vocab_padding,
+            group,
+        )
+        # group.all_gather(dim=0) concatenates rank-local batches in rank order,
+        # so we slice back the portion owned by the current LMHead TP rank.
+        start = group.rank_in_group * local_bs
+        end = start + local_bs
+        return top_tokens[start:end]
+
     def _get_logits_normal(
         self,
         hidden_states: torch.Tensor,
@@ -286,3 +366,23 @@ class AscendLogitsProcessor(LogitsProcessor):
             logits = logits[..., : self.org_vocab_size]
 
         return logits
+
+    def _get_top_tokens_normal(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: AscendParallelLMHead,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        group = get_tp_group()
+        local_logits = lm_head.quant_method.apply(
+            lm_head,
+            hidden_states,
+            bias=embedding_bias,
+        )
+        local_logits = self._apply_logits_postprocess(local_logits)
+        return self._get_top_tokens_from_local_logits(
+            local_logits,
+            lm_head.shard_indices.org_vocab_start_index,
+            lm_head.shard_indices.num_org_vocab_padding,
+            group,
+        )

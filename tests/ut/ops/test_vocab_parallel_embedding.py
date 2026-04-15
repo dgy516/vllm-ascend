@@ -267,3 +267,112 @@ class TestAscendLogitsProcessor(unittest.TestCase):
         hidden_state = torch.randn(1, self.org_num_embeddings)
         processor._get_logits(hidden_state, lmhead)
         self.mock_quant_method.apply.assert_called_once()
+
+    def test_get_top_tokens_normal_tp(self):
+        processor = AscendLogitsProcessor(vocab_size=self.vocab_size)
+        local_logits = torch.tensor(
+            [
+                [1.0, 2.0, 100.0],
+                [0.5, -0.2, 90.0],
+            ],
+            dtype=torch.float32,
+        )
+        lmhead = MagicMock()
+        lmhead.quant_method.apply = MagicMock(return_value=local_logits.clone())
+        lmhead.shard_indices.org_vocab_start_index = 10
+        lmhead.shard_indices.num_org_vocab_padding = 1
+
+        normal_group = MagicMock()
+        normal_group.world_size = 2
+        normal_group.rank_in_group = 0
+        normal_group.all_gather = MagicMock(
+            return_value=torch.tensor(
+                [
+                    [2.0, 11.0, 3.0, 20.0],
+                    [0.5, 10.0, -1.0, 21.0],
+                ],
+                dtype=torch.float32,
+            )
+        )
+
+        with patch(
+            "vllm_ascend.ops.vocab_parallel_embedding.lmhead_tp_enable",
+            return_value=False,
+        ), patch(
+            "vllm_ascend.ops.vocab_parallel_embedding.get_tp_group",
+            return_value=normal_group,
+        ):
+            top_tokens = processor.get_top_tokens(
+                lmhead,
+                torch.randn(2, self.embedding_dim),
+            )
+
+        torch.testing.assert_close(
+            top_tokens,
+            torch.tensor([20, 10], dtype=torch.int64),
+        )
+        lmhead.quant_method.apply.assert_called_once()
+        normal_group.all_gather.assert_called_once()
+
+    def test_get_top_tokens_lmheadtp(self):
+        processor = AscendLogitsProcessor(vocab_size=self.vocab_size)
+        local_logits = torch.tensor(
+            [
+                [0.1, 1.0, 100.0],
+                [5.0, 4.0, 90.0],
+                [2.0, 3.0, 80.0],
+                [-2.0, -3.0, 70.0],
+            ],
+            dtype=torch.float32,
+        )
+        lmhead = MagicMock()
+        lmhead.quant_method.apply = MagicMock(return_value=local_logits.clone())
+        lmhead.shard_indices.org_vocab_start_index = 10
+        lmhead.shard_indices.num_org_vocab_padding = 1
+
+        group = MagicMock()
+        group.world_size = 2
+        group.rank_in_group = 1
+
+        gathered_hidden_states = torch.arange(12, dtype=torch.float32).view(4, 3)
+        gathered_pairs = torch.tensor(
+            [
+                [1.0, 11.0, 2.0, 20.0],
+                [5.0, 10.0, 1.0, 21.0],
+                [3.0, 11.0, 4.0, 22.0],
+                [-2.0, 10.0, -1.0, 23.0],
+            ],
+            dtype=torch.float32,
+        )
+
+        def all_gather_side_effect(tensor, dim=0):
+            if dim == 0:
+                return gathered_hidden_states
+            if dim == -1:
+                return gathered_pairs
+            raise AssertionError(f"Unexpected gather dim: {dim}")
+
+        group.all_gather = MagicMock(side_effect=all_gather_side_effect)
+
+        with patch(
+            "vllm_ascend.ops.vocab_parallel_embedding.get_lmhead_tp_group",
+            return_value=group,
+        ), patch(
+            "vllm_ascend.ops.vocab_parallel_embedding.lmhead_tp_enable",
+            return_value=True,
+        ):
+            top_tokens = processor.get_top_tokens(
+                lmhead,
+                torch.randn(2, self.embedding_dim),
+            )
+
+        torch.testing.assert_close(
+            top_tokens,
+            torch.tensor([22, 23], dtype=torch.int64),
+        )
+        lmhead.quant_method.apply.assert_called_once_with(
+            lmhead,
+            gathered_hidden_states,
+            bias=None,
+        )
+        self.assertEqual(group.all_gather.call_count, 2)

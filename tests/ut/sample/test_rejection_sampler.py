@@ -15,11 +15,13 @@
 from unittest.mock import patch
 
 import torch
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from tests.ut.base import TestBase
 from vllm_ascend.sample.rejection_sampler import (
-    expand_batch_to_tokens, expand_pytorch, rejection_greedy_sample_pytorch,
-    rejection_random_sample_pytorch, sample_recovered_tokens_pytorch)
+    expand_batch_to_tokens, expand_pytorch, greedy_rejection_sample,
+    rejection_greedy_sample_pytorch, rejection_random_sample_pytorch,
+    sample_recovered_tokens_pytorch)
 
 # Global constants
 PLACEHOLDER_TOKEN_ID = -1
@@ -73,6 +75,37 @@ class TestAscendRejectionSampler(TestBase):
         assert output_token_ids[0, 1].item() == 99
         assert output_token_ids[1, 0].item() == 20
         assert output_token_ids[1, 2].item() == PLACEHOLDER_TOKEN_ID
+
+    @patch('torch.arange', new=mock_pin_memory(torch.arange))
+    @patch('torch.ones', new=mock_pin_memory(torch.ones))
+    @patch('torch.full', new=mock_pin_memory(torch.full))
+    @patch('torch.tensor', new=mock_pin_memory(torch.tensor))
+    def test_greedy_rejection_sample_argmax_only(self):
+        metadata = SpecDecodeMetadata(
+            draft_token_ids=torch.tensor([10, 11, 20], dtype=torch.int32),
+            num_draft_tokens=[2, 1],
+            cu_num_draft_tokens=torch.tensor([2, 3], dtype=torch.int32),
+            cu_num_sampled_tokens=torch.tensor([3, 5], dtype=torch.int32),
+            target_logits_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+            bonus_logits_indices=torch.tensor([3, 4], dtype=torch.int32),
+            logits_indices=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
+        )
+
+        sampled_token_ids = greedy_rejection_sample(
+            metadata=metadata,
+            target_argmax=torch.tensor([10, 99, 20], dtype=torch.int64),
+            bonus_token_ids=torch.tensor([[100], [200]], dtype=torch.int32),
+            sampling_metadata=type("SamplingMetadataStub", (), {"all_greedy": True})(),
+        )
+
+        expected = torch.tensor(
+            [
+                [10, 99, PLACEHOLDER_TOKEN_ID],
+                [20, 200, PLACEHOLDER_TOKEN_ID],
+            ],
+            dtype=torch.int32,
+        )
+        torch.testing.assert_close(sampled_token_ids, expected)
 
     @patch('torch.arange', new=mock_pin_memory(torch.arange))
     @patch('torch.ones', new=mock_pin_memory(torch.ones))

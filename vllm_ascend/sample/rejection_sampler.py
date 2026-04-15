@@ -9,6 +9,7 @@ from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     generate_uniform_probs,
 )
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.ops.triton.reject_sample import (
     cal_grid_and_block_size,
@@ -19,6 +20,63 @@ from vllm_ascend.ops.triton.reject_sample import (
     sample_recovered_tokens_kernel,
 )
 from vllm_ascend.sample.sampler import apply_top_k_top_p
+
+
+def greedy_rejection_sample(
+    metadata: SpecDecodeMetadata,
+    target_argmax: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+) -> torch.Tensor:
+    """Run greedy speculative verification from argmax tokens only."""
+    assert sampling_metadata.all_greedy
+    assert target_argmax.ndim == 1
+    assert target_argmax.shape[0] == metadata.draft_token_ids.shape[0]
+    assert bonus_token_ids.shape == (len(metadata.num_draft_tokens), 1)
+
+    batch_size = len(metadata.num_draft_tokens)
+    output_token_ids = torch.empty(
+        (batch_size, metadata.max_spec_len + 1),
+        dtype=torch.int32,
+        device=target_argmax.device,
+    )
+    output_token_ids.fill_(PLACEHOLDER_TOKEN_ID)
+
+    if HAS_TRITON:
+        grid, block_size = cal_grid_and_block_size(batch_size)
+        rejection_greedy_sample_with_triton(
+            output_token_ids,
+            metadata.num_draft_tokens,
+            metadata.cu_num_draft_tokens,
+            metadata.draft_token_ids,
+            target_argmax,
+            bonus_token_ids,
+            None,
+            metadata.max_spec_len,
+            grid,
+            block_size,
+        )
+        return output_token_ids
+
+    if min(metadata.num_draft_tokens) == 1 and max(metadata.num_draft_tokens) == 1:
+        rejection_greedy_sample_spec_len_1_pytorch(
+            output_token_ids,
+            metadata.draft_token_ids,
+            target_argmax,
+            bonus_token_ids,
+        )
+    else:
+        rejection_greedy_sample_pytorch(
+            output_token_ids,
+            metadata.cu_num_draft_tokens,
+            metadata.draft_token_ids,
+            target_argmax,
+            bonus_token_ids,
+            metadata.num_draft_tokens,
+            metadata.max_spec_len,
+            is_greedy=None,
+        )
+    return output_token_ids
 
 
 def apply_sampling_constraints(

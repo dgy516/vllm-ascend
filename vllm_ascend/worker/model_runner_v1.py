@@ -72,6 +72,10 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -110,6 +114,7 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.quantization.utils import enable_fa_quant
+from vllm_ascend.sample.rejection_sampler import greedy_rejection_sample
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -206,7 +211,7 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -1426,7 +1431,13 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if (
+                    self._is_greedy_fastpath_candidate(spec_decode_metadata)
+                    or self._is_spec_greedy_fastpath_candidate(spec_decode_metadata)
+                ):
+                    logits = None
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -1509,17 +1520,35 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # Apply structured output bitmasks if present.
-        if grammar_output is not None:
-            # here we are different from gpu_model_runner,
-            # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
-            logits_dtype = logits.dtype
-            logits = logits.to("cpu").float()
-            apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
-            logits = logits.to(self.device).to(logits_dtype)
-
         with record_function_or_nullcontext("sample_token"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            if self._can_run_greedy_fastpath(grammar_output, spec_decode_metadata):
+                top_tokens = self._get_top_tokens_for_model(
+                    sample_hidden_states,
+                    expected_num_tokens=self.input_batch.num_reqs,
+                )
+                sampler_output = self._build_greedy_sampler_output(top_tokens)
+            elif self._can_run_spec_greedy_fastpath(
+                grammar_output,
+                spec_decode_metadata,
+            ):
+                assert spec_decode_metadata is not None
+                sampler_output = self._build_spec_greedy_sampler_output(
+                    sample_hidden_states,
+                    spec_decode_metadata,
+                )
+            else:
+                if logits is None:
+                    logits = self.model.compute_logits(sample_hidden_states)
+                # Apply structured output bitmasks if present.
+                if grammar_output is not None:
+                    # here we are different from gpu_model_runner,
+                    # the apply_grammar_bitmask uses torch.compile to optimize this,
+                    # ascend does not support it now
+                    logits_dtype = logits.dtype
+                    logits = logits.to("cpu").float()
+                    apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
+                    logits = logits.to(self.device).to(logits_dtype)
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1656,6 +1685,129 @@ class NPUModelRunner(GPUModelRunner):
             sampling_metadata,
         )
         return sampler_output
+
+    def _is_greedy_fastpath_candidate(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        return (
+            spec_decode_metadata is None
+            and self._has_clean_greedy_sampling_state()
+        )
+
+    def _is_spec_greedy_fastpath_candidate(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        return (
+            spec_decode_metadata is not None
+            and self._has_clean_greedy_sampling_state()
+        )
+
+    def _has_clean_greedy_sampling_state(self) -> bool:
+        sampling_metadata = self.input_batch.sampling_metadata
+        return (
+            sampling_metadata.all_greedy
+            and sampling_metadata.max_num_logprobs is None
+            and sampling_metadata.no_penalties
+            and sampling_metadata.allowed_token_ids_mask is None
+            and not sampling_metadata.bad_words_token_ids
+            and not self._has_active_argmax_changing_logitsprocs()
+            and not self.broadcast_pp_output
+        )
+
+    def _has_active_argmax_changing_logitsprocs(self) -> bool:
+        for logitsproc in getattr(
+            self.input_batch.logitsprocs,
+            "non_argmax_invariant",
+            (),
+        ):
+            if isinstance(logitsproc, MinTokensLogitsProcessor):
+                if logitsproc.min_toks:
+                    return True
+                continue
+            if isinstance(logitsproc, LogitBiasLogitsProcessor):
+                if logitsproc.biases:
+                    return True
+                continue
+            return True
+        return False
+
+    def _can_run_greedy_fastpath(
+        self,
+        grammar_output: "GrammarOutput | None",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        return (
+            self._is_greedy_fastpath_candidate(spec_decode_metadata)
+            and grammar_output is None
+        )
+
+    def _can_run_spec_greedy_fastpath(
+        self,
+        grammar_output: "GrammarOutput | None",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        return (
+            self._is_spec_greedy_fastpath_candidate(spec_decode_metadata)
+            and grammar_output is None
+        )
+
+    def _get_top_tokens_for_model(
+        self,
+        sample_hidden_states: torch.Tensor,
+        expected_num_tokens: int | None = None,
+    ) -> torch.Tensor:
+        assert self.model is not None
+        if hasattr(self.model, "get_top_tokens"):
+            top_tokens = self.model.get_top_tokens(sample_hidden_states)
+        elif hasattr(self.model, "logits_processor") and hasattr(self.model, "lm_head"):
+            embedding_bias = getattr(self.model.lm_head, "bias", None)
+            top_tokens = self.model.logits_processor.get_top_tokens(
+                self.model.lm_head,
+                sample_hidden_states,
+                embedding_bias,
+            )
+        else:
+            logits = self.model.compute_logits(sample_hidden_states)
+            top_tokens = logits.argmax(dim=-1)
+
+        if expected_num_tokens is None:
+            expected_num_tokens = self.input_batch.num_reqs
+        if top_tokens.shape[0] > expected_num_tokens:
+            top_tokens = top_tokens[:expected_num_tokens]
+        return top_tokens
+
+    @staticmethod
+    def _build_greedy_sampler_output(top_tokens: torch.Tensor) -> SamplerOutput:
+        return SamplerOutput(
+            sampled_token_ids=top_tokens.to(torch.int32).unsqueeze(-1),
+            logprobs_tensors=None,
+        )
+
+    def _build_spec_greedy_sampler_output(
+        self,
+        sample_hidden_states: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata,
+    ) -> SamplerOutput:
+        top_tokens = self._get_top_tokens_for_model(
+            sample_hidden_states,
+            expected_num_tokens=len(spec_decode_metadata.logits_indices),
+        )
+        target_argmax = top_tokens[spec_decode_metadata.target_logits_indices]
+        bonus_token_ids = top_tokens[
+            spec_decode_metadata.bonus_logits_indices
+        ].to(torch.int32).unsqueeze(-1)
+        sampled_token_ids = greedy_rejection_sample(
+            spec_decode_metadata,
+            target_argmax=target_argmax,
+            bonus_token_ids=bonus_token_ids,
+            sampling_metadata=self.input_batch.sampling_metadata,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled_token_ids,
+            logprobs_tensors=None,
+        )
 
     # TODO: remove this func after eagle_proposer is refactored and
     #  _bookkeeping_sync is moved after propose_draft_token_ids
