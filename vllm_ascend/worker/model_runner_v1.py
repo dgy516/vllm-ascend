@@ -1700,10 +1700,9 @@ class NPUModelRunner(GPUModelRunner):
         self,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> bool:
-        return (
-            spec_decode_metadata is not None
-            and self._has_clean_greedy_sampling_state()
-        )
+        # Speculative verification still relies on full compute_logits()
+        # semantics for correctness on some models (for example Qwen3.5 MTP).
+        return False
 
     def _has_clean_greedy_sampling_state(self) -> bool:
         sampling_metadata = self.input_batch.sampling_metadata

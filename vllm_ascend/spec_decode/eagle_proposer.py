@@ -46,7 +46,6 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
-from vllm_ascend.sample.top_tokens import get_greedy_top_tokens
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
@@ -171,27 +170,21 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         self.token_arange_np = np.arange(self.max_num_tokens + 1)
 
-    def _get_top_tokens_for_model(
-        self,
-        sample_hidden_states: torch.Tensor,
-        expected_num_tokens: int | None = None,
-    ) -> torch.Tensor:
-        top_tokens = get_greedy_top_tokens(self.model, sample_hidden_states)
-
-        if expected_num_tokens is not None and top_tokens.shape[0] > expected_num_tokens:
-            top_tokens = top_tokens[:expected_num_tokens]
-        return top_tokens
-
     def _greedy_sample(
         self,
         hidden_states: torch.Tensor,
         expected_num_tokens: int | None = None,
     ) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
-        return self._get_top_tokens_for_model(
-            hidden_states,
-            expected_num_tokens=expected_num_tokens,
-        )
+        if hasattr(self.model, "get_top_tokens"):
+            top_tokens = self.model.get_top_tokens(hidden_states)
+        else:
+            logits = self.model.compute_logits(hidden_states)
+            top_tokens = logits.argmax(dim=-1)
+
+        if expected_num_tokens is not None and top_tokens.shape[0] > expected_num_tokens:
+            top_tokens = top_tokens[:expected_num_tokens]
+        return top_tokens
 
     def _get_model(self) -> nn.Module:
         """

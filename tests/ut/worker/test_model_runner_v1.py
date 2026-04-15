@@ -147,7 +147,7 @@ class TestNPUModelRunnerGreedyFastPath(unittest.TestCase):
         runner = self._build_runner()
         metadata = SpecDecodeMetadata.make_dummy([[1], [2]], torch.device("cpu"))
 
-        self.assertTrue(runner._is_spec_greedy_fastpath_candidate(metadata))
+        self.assertFalse(runner._is_spec_greedy_fastpath_candidate(metadata))
         self.assertFalse(runner._is_spec_greedy_fastpath_candidate(None))
 
     def test_is_spec_greedy_fastpath_candidate_allows_inactive_min_tokens(self):
@@ -161,7 +161,7 @@ class TestNPUModelRunnerGreedyFastPath(unittest.TestCase):
         ])
         metadata = SpecDecodeMetadata.make_dummy([[1], [2]], torch.device("cpu"))
 
-        self.assertTrue(runner._is_spec_greedy_fastpath_candidate(metadata))
+        self.assertFalse(runner._is_spec_greedy_fastpath_candidate(metadata))
 
     def test_is_greedy_fastpath_candidate_rejects_active_min_tokens(self):
         runner = self._build_runner()
