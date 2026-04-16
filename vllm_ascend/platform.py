@@ -61,6 +61,14 @@ else:
 _CUSTOM_OP_REGISTERED = False
 
 
+def select_default_all2all_backend(enable_dbo: bool, enable_sp: bool) -> str | None:
+    if enable_sp:
+        return None
+    if enable_dbo:
+        return "deepep_low_latency"
+    return "flashinfer_all2allv"
+
+
 def config_deprecated_logging():
     """Configure deprecated logging format, when used deprecated codes
     in vllm-ascend.
@@ -415,9 +423,17 @@ class NPUPlatform(Platform):
             )
 
         if parallel_config and parallel_config.worker_cls == "auto":
-            # TODO: this is a tricky way to disable `use_sequence_parallel_moe` in vllm.
-            if not vllm_config.compilation_config.pass_config.enable_sp:
-                parallel_config.all2all_backend = "flashinfer_all2allv"
+            all2all_backend = select_default_all2all_backend(
+                enable_dbo=parallel_config.enable_dbo,
+                enable_sp=vllm_config.compilation_config.pass_config.enable_sp,
+            )
+            if all2all_backend is not None:
+                # Upstream DBO validation only accepts deepep_* backends for
+                # ubatching. Keep the Ascend default backend for non-DBO
+                # serving, but switch the config-level backend in DBO mode so
+                # engine creation can proceed. Ascend runtime MoE dispatch is
+                # selected later through select_moe_comm_method().
+                parallel_config.all2all_backend = all2all_backend
             if is_310p():
                 parallel_config.worker_cls = "vllm_ascend._310p.worker_310p.NPUWorker310"
             elif ascend_config.xlite_graph_config.enabled:

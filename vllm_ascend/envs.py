@@ -71,7 +71,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
-    "VLLM_ASCEND_ENABLE_FLASHCOMM1": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", "0"))),
+    # Fall back to ASCEND_ENABLE_FLASHCOMM1 so engine subprocesses still see the
+    # setting even if upstream vLLM strips unknown VLLM_* envs during startup.
+    "VLLM_ASCEND_ENABLE_FLASHCOMM1": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", os.getenv("ASCEND_ENABLE_FLASHCOMM1", "0")))
+    ),
     # Whether to enable FLASHCOMM2. Setting it to 0 disables the feature, while setting it to 1 or above enables it.
     # The specific value set will be used as the O-matrix TP group size for flashcomm2.
     # For a detailed introduction to the parameters and the differences and applicable scenarios

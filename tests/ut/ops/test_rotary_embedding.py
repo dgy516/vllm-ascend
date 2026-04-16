@@ -39,6 +39,28 @@ def _make_tensors(seq_len=SEQ_LEN, num_heads=NUM_HEADS, head_size=HEAD_SIZE):
     return positions, query, key
 
 
+def test_get_cos_and_sin_mla_falls_back_when_persistent_cache_is_unavailable():
+    positions = torch.arange(4, dtype=torch.long)
+    cos_cache = torch.arange(32, dtype=torch.float32).view(8, 4)
+    sin_cache = cos_cache + 100
+    expected_cos = cos_cache[positions].unsqueeze(1).unsqueeze(2)
+    expected_sin = sin_cache[positions].unsqueeze(1).unsqueeze(2)
+
+    with patch("vllm_ascend.ops.rotary_embedding._cos_cache", cos_cache), patch(
+        "vllm_ascend.ops.rotary_embedding._sin_cache", sin_cache
+    ), patch(
+        "vllm_ascend.ops.rotary_embedding._cos_mla", None
+    ), patch(
+        "vllm_ascend.ops.rotary_embedding._sin_mla", None
+    ):
+        from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
+
+        cos, sin = get_cos_and_sin_mla(positions, use_cache=True)
+
+    assert torch.equal(cos, expected_cos)
+    assert torch.equal(sin, expected_sin)
+
+
 def check_parent_init_signature_has_not_changed(parent_func, child_func):
     parent_sig = inspect.signature(parent_func)
     parent_params = set(parent_sig.parameters) - {"self"}

@@ -111,6 +111,14 @@ class AscendUBatchWrapper(UBatchWrapper):
         # in case we need to access the original runnable.
         return self.runnable
 
+    def _get_model_runnable(self) -> Callable:
+        # Upstream wrappers often receive a runner-like object that exposes
+        # `.model`, while Ascend wraps the model callable itself.
+        return self.runnable.model if hasattr(self.runnable, "model") else self.runnable
+
+    def _get_safe_ubatch_cudagraph_mode(self, cudagraph_runtime_mode: CUDAGraphMode) -> CUDAGraphMode:
+        return cudagraph_runtime_mode
+
     def _capture_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
         """
         Capture a cudagraph for a microbatched run.
@@ -316,14 +324,14 @@ class AscendUBatchWrapper(UBatchWrapper):
         return ubatch_metadata
 
     def _slice_model_inputs(self, tokens_slice: slice, input_ids, positions, inputs_embeds, intermediate_tensors):
-        sliced_input_ids = input_ids[tokens_slice]
+        sliced_input_ids = input_ids[tokens_slice] if input_ids is not None else None
         # if we are using mrope. Mrope adds an additional dimension to the
         # positions tensor
         if positions.ndim == 2:
             sliced_positions = positions[:, tokens_slice]
         else:
             sliced_positions = positions[tokens_slice]
-        sliced_inputs_embeds = inputs_embeds[tokens_slice] if inputs_embeds else None
+        sliced_inputs_embeds = inputs_embeds[tokens_slice] if inputs_embeds is not None else None
         # consider pp scenario
         if intermediate_tensors is not None:
             # if enable sp, dbo should not split intermediate tensors using token_slice
@@ -337,7 +345,9 @@ class AscendUBatchWrapper(UBatchWrapper):
                     stop = (tokens_slice.stop + tp_size - 1) // tp_size
                 tokens_slice = slice(start, stop)
 
-            sliced_intermediate_tensors = intermediate_tensors[tokens_slice] if intermediate_tensors else None
+            sliced_intermediate_tensors = (
+                intermediate_tensors[tokens_slice] if intermediate_tensors is not None else None
+            )
         else:
             sliced_intermediate_tensors = None
 
@@ -369,6 +379,7 @@ class AscendUBatchWrapper(UBatchWrapper):
                 return self.cudagraph_wrapper(*args, **kwargs)
 
         attn_metadata = forward_context.attn_metadata
+        cudagraph_runtime_mode = self._get_safe_ubatch_cudagraph_mode(cudagraph_runtime_mode)
         num_tokens = (ubatch_slices[0].token_slice.stop - ubatch_slices[0].token_slice.start) * 2
         input_ids = kwargs["input_ids"]
         positions = kwargs["positions"]
@@ -410,7 +421,7 @@ class AscendUBatchWrapper(UBatchWrapper):
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
-            return self._capture_ubatches(ubatch_metadata, self.model)
+            return self._capture_ubatches(ubatch_metadata, self._get_model_runnable())
         elif num_tokens in self.cudagraphs and cudagraph_runtime_mode is CUDAGraphMode.FULL:
             cudagraph_metadata = self.cudagraphs[num_tokens]
             cudagraph_metadata.aclgraph.replay()
@@ -428,7 +439,7 @@ class AscendUBatchWrapper(UBatchWrapper):
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
-            return self._run_ubatches(ubatch_metadata, self.model)
+            return self._run_ubatches(ubatch_metadata, self._get_model_runnable())
 
     def _merge_intermediate_tensors(self, intermediate_tensor_list):
         assert len(intermediate_tensor_list) == 2

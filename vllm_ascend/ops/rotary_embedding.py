@@ -97,6 +97,8 @@ def get_cos_and_sin_mla(positions, use_cache=False):
         return cos, sin
     global _cos_mla
     global _sin_mla
+    if _cos_mla is None or _sin_mla is None:
+        return cos, sin
     num_tokens = positions.size(0)
     _cos_mla[:num_tokens, ...] = cos
     _sin_mla[:num_tokens, ...] = sin

@@ -190,8 +190,15 @@ def create_ascend_forward_context(
     dbo_template: Any = None,
     skip_compiled: bool = False,
 ):
+    if vllm_config.compilation_config.fast_moe_cold_start:
+        all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
+    else:
+        all_moe_layers = None
+
     new_forward_context = ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
+        all_moe_layers=all_moe_layers,
+        virtual_engine=virtual_engine,
         attn_metadata=attn_metadata,
         slot_mapping={},
         dp_metadata=dp_metadata,
@@ -199,6 +206,7 @@ def create_ascend_forward_context(
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
+        additional_kwargs={},
     )
 
     new_forward_context.flash_comm_v1_enabled = cur_forward_context.flash_comm_v1_enabled
@@ -256,9 +264,12 @@ def create_ascend_forward_context(
             new_forward_context.mc2_mask = mc2_mask
 
     new_forward_context.dbo_enabled = True
-    new_forward_context.dbo_first_layer_sync = True
+    new_forward_context.dbo_first_layer_sync = ubatch_num == 0
 
-    # vllm-ascend use global cos/sin cache, which should be sliced when using dbo
+    # vllm-ascend uses global cos/sin buffers that are refreshed by the model
+    # runner before each forward. Keep ubatch contexts as views into those
+    # buffers so full-graph replay reads current values instead of capture-time
+    # clones.
     from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla, get_cos_and_sin_slice, update_cos_sin
 
     if ubatch_slices and ubatch_slices[ubatch_num]:
@@ -267,10 +278,10 @@ def create_ascend_forward_context(
 
         update_cos_sin(positions)
         cos_slice, sin_slice = get_cos_and_sin_slice()
-        new_forward_context.cos = cos_slice.clone()[:, token_slice] if cos_slice is not None else None
-        new_forward_context.sin = sin_slice.clone()[:, token_slice] if sin_slice is not None else None
+        new_forward_context.cos = cos_slice[:, token_slice] if cos_slice is not None else None
+        new_forward_context.sin = sin_slice[:, token_slice] if sin_slice is not None else None
 
-        cos_mla, sin_mla = get_cos_and_sin_mla(positions)
+        cos_mla, sin_mla = get_cos_and_sin_mla(positions, use_cache=True)
 
         new_forward_context.cos_mla = cos_mla[token_slice] if cos_mla is not None else None
 

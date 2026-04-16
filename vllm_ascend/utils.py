@@ -793,7 +793,10 @@ def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
             from vllm.config import get_current_vllm_config
 
             vllm_config = get_current_vllm_config()
+        additional_config = vllm_config.additional_config if vllm_config is not None else {}
         _ENABLE_SP = (
+            bool(additional_config.get("enable_flashcomm1", False))
+            or
             envs_ascend.VLLM_ASCEND_ENABLE_FLASHCOMM1
             # Flash comm 1 should be enabled by env VLLM_ASCEND_ENABLE_FLASHCOMM1
             # We retain the env VLLM_ASCEND_ENABLE_FLASHCOMM here for backward compatibility.
