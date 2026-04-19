@@ -668,6 +668,7 @@ class NPUPlatform(Platform):
             num_tokens,
             vllm_config,
             is_draft_model=is_draft_model,
+            aclgraph_runtime_mode=cudagraph_runtime_mode,
         )
         moe_comm_method = get_moe_comm_method(moe_comm_type)
 

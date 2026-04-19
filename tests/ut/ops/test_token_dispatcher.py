@@ -89,6 +89,8 @@ class TestTokenDispatcherWithMC2(TestBase):
         mock_config.scheduler_config.decode_max_num_seqs = 256
 
         mock_config.compilation_config.custom_ops = ["all"]
+        mock_config.compilation_config.cudagraph_capture_sizes = None
+        mock_config.compilation_config.max_cudagraph_capture_size = 0
 
         mock_config.speculative_config = None
 
@@ -121,20 +123,44 @@ class TestTokenDispatcherWithMC2(TestBase):
             "vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_device_type",
             return_value=AscendDeviceType.A3)
         self.ascend_soc_version_patch.start()
+        self.hierarchy_comm_patch = patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.is_hierarchical_communication_enabled",
+            return_value=False,
+        )
+        self.hierarchy_comm_patch.start()
+        self.ascend_config_patch = patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_config",
+            return_value=MagicMock(enable_mc2_hierarchy_comm=False),
+        )
+        self.ascend_config_patch.start()
 
         kwargs = {"with_quant": False, "top_k": 8, "num_experts": 128}
         self.dispatcher = TokenDispatcherWithMC2(**kwargs)
 
     def tearDown(self):
+        self.config_patcher.stop()
         self.mc2_group_patch.stop()
+        self.rank_group_patch.stop()
         self.forward_context_patch.stop()
         self.ascend_soc_version_patch.stop()
+        self.hierarchy_comm_patch.stop()
+        self.ascend_config_patch.stop()
 
     def test_init(self):
         self.assertEqual(self.dispatcher.ep_rank_id, 0)
         self.assertEqual(self.dispatcher.ep_world_size, 8)
         self.assertTrue(self.dispatcher.enable_dispatch_v2)
         self.assertTrue(self.dispatcher.need_extra_args)
+
+    def test_init_caps_global_bs_for_a3_graph_sizes(self):
+        mock_config = self.mock_get_config.return_value
+        mock_config.compilation_config.cudagraph_capture_sizes = [1024, 2048, 4096, 8192]
+        mock_config.compilation_config.max_cudagraph_capture_size = 8192
+        mock_config.parallel_config.tensor_parallel_size = 8
+
+        dispatcher = TokenDispatcherWithMC2(with_quant=False, top_k=8, num_experts=128)
+
+        self.assertEqual(dispatcher.global_bs, 4096)
 
     def test_get_dispatch_mc2_kwargs_without_quant(self):
         hidden_states = torch.randn(10, 128)
@@ -452,8 +478,13 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.mock_npu_dynamic_quant.return_value = (torch.randn(16, 16),
                                                     torch.randn(16))
 
+        patcher10_1 = patch('torch.distributed.get_rank', return_value=0)
+        self.mock_get_rank = patcher10_1.start()
+        self.addCleanup(patcher10_1.stop)
+
         # Mock torch.ops._C_ascend.npu_moe_init_routing_custom
-        patcher11 = patch('torch.ops._C_ascend.npu_moe_init_routing_custom')
+        patcher11 = patch('torch.ops._C_ascend.npu_moe_init_routing_custom',
+                          create=True)
         self.mock_npu_moe_init_routing_custom = patcher11.start()
         self.addCleanup(patcher11.stop)
         self.mock_npu_moe_init_routing_custom.return_value = (torch.randn(
@@ -469,6 +500,19 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
                                                       num_experts=4,
                                                       num_local_experts=2,
                                                       with_quant=False)
+
+    def test_preprocess_sets_repeat_interleave_output_size(self):
+        self.dispatcher.expert_ids_per_ep_rank = torch.tensor(
+            [0, 1], dtype=torch.int32)
+        self.dispatcher.local_expert_indices = [0, 1]
+        topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+
+        self.dispatcher._preprocess(topk_ids)
+
+        _, repeats = self.mock_repeat_interleave.call_args.args
+        output_size = self.mock_repeat_interleave.call_args.kwargs["output_size"]
+        self.assertTrue(torch.equal(repeats, torch.tensor([2, 2, 2, 2], dtype=torch.int64)))
+        self.assertEqual(output_size, 8)
 
     @pytest.mark.skip(
         "Skip as register_kernels has NPU SocName checking in CANN 8.5.0.")

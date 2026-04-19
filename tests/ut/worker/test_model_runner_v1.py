@@ -1,11 +1,14 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.config import CUDAGraphMode
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.worker.model_runner_v1 import NPUModelRunner, _torch_cuda_wrapper
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
@@ -83,6 +86,59 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+
+
+class TestTorchCudaWrapper(unittest.TestCase):
+
+    def test_maps_stream_capture_check_to_npu(self):
+        original = torch.cuda.is_current_stream_capturing
+        try:
+            with _torch_cuda_wrapper():
+                self.assertIs(
+                    torch.cuda.is_current_stream_capturing,
+                    torch.npu.is_current_stream_capturing,
+                )
+        finally:
+            torch.cuda.is_current_stream_capturing = original
+
+
+class TestNPUModelRunnerProfileRun(unittest.TestCase):
+
+    def _build_runner(self, cudagraph_mode):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.max_num_tokens = 8192
+        runner.max_num_reqs = 1
+        runner.pcp_size = 1
+        runner.eplb_warmup = MagicMock()
+        runner._dummy_run = MagicMock()
+        runner.vllm_config = SimpleNamespace(
+            compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
+        )
+        return runner
+
+    def test_profile_run_skips_mc2_dummy_run_for_graph_mode(self):
+        runner = self._build_runner(CUDAGraphMode.FULL)
+        with (
+            patch("vllm_ascend.worker.model_runner_v1.get_mc2_tokens_capacity", return_value=4096),
+            patch("vllm_ascend.worker.model_runner_v1.select_moe_comm_method", return_value=MoECommType.MC2),
+            patch.object(GPUModelRunner, "profile_run", autospec=True) as super_profile_run,
+        ):
+            NPUModelRunner.profile_run(runner)
+
+        runner._dummy_run.assert_not_called()
+        super_profile_run.assert_called_once_with(runner)
+
+    def test_profile_run_keeps_mc2_dummy_run_for_eager(self):
+        runner = self._build_runner(CUDAGraphMode.NONE)
+        with (
+            patch("vllm_ascend.worker.model_runner_v1.get_mc2_tokens_capacity", return_value=4096),
+            patch("vllm_ascend.worker.model_runner_v1.select_moe_comm_method", return_value=MoECommType.MC2),
+            patch.object(GPUModelRunner, "profile_run", autospec=True) as super_profile_run,
+        ):
+            NPUModelRunner.profile_run(runner)
+
+        runner._dummy_run.assert_called_once_with(4096, with_prefill=True, is_profile=True)
+        super_profile_run.assert_called_once_with(runner)
 
 
 if __name__ == "__main__":

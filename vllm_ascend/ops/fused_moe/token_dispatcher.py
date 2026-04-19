@@ -28,6 +28,7 @@ import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
 
+from vllm_ascend.ascend_forward_context import get_mc2_max_num_tokens
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -110,10 +111,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         uniform_decode_query_len = 1 if not speculative_config else 1 + speculative_config.num_speculative_tokens
         decode_max_num_seqs = getattr(scheduler_config, "decode_max_num_seqs", 0)
         max_num_reqs = max(scheduler_config.max_num_seqs, decode_max_num_seqs)
-        if compilation_config.cudagraph_capture_sizes:
-            max_num_tokens = compilation_config.max_cudagraph_capture_size
-        else:
-            max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
+        max_num_tokens = get_mc2_max_num_tokens(
+            vllm_config,
+            max_num_reqs,
+            uniform_decode_query_len,
+        )
         num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
         self.global_bs = num_tokens_per_tp_rank * self.ep_world_size
 
@@ -527,7 +529,9 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         input_splits = (
             num_local_tokens_per_expert.reshape(ep_size, self.num_local_experts)
             .sum(axis=1)
-            .to(torch.device("cpu"), non_blocking=True)
+            # Split sizes are consumed immediately on CPU by all_to_all.
+            # A blocking copy avoids reading an incomplete host buffer.
+            .to(torch.device("cpu"))
             .numpy()
         )
 
@@ -541,7 +545,9 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             raise ValueError("num_global_tokens_per_local_expert must be set before sum.")
 
         output_splits = (
-            num_global_tokens_per_local_expert.sum(axis=-1).to(torch.device("cpu"), non_blocking=True).numpy()
+            # Split sizes are consumed immediately on CPU by all_to_all.
+            # A blocking copy avoids reading an incomplete host buffer.
+            num_global_tokens_per_local_expert.sum(axis=-1).to(torch.device("cpu")).numpy()
         )
         num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(axis=0)
 
@@ -549,8 +555,13 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         if self.num_local_experts > 1:
             if num_global_tokens_per_local_expert is None:
                 raise ValueError("num_global_tokens_per_local_expert must be set before operations.")
+            num_global_output_tokens = int(output_splits.sum())
             global_input_tokens_local_experts_indices = torch.repeat_interleave(
-                self.expert_ids_per_ep_rank, num_global_tokens_per_local_expert.ravel()
+                self.expert_ids_per_ep_rank,
+                num_global_tokens_per_local_expert.ravel(),
+                # Keep the output shape explicit so graph capture does not need
+                # to infer it from device-side repeats.
+                output_size=num_global_output_tokens,
             )
         else:
             torch.npu.synchronize()

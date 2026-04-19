@@ -30,6 +30,33 @@ class MoECommType(Enum):
     FUSED_MC2 = 3
 
 
+A3_MC2_MAX_TOKENS_PER_TP_RANK = 512
+
+
+def get_mc2_max_num_tokens(
+    vllm_config: VllmConfig,
+    max_num_reqs: int,
+    uniform_decode_query_len: int,
+) -> int:
+    """Compute the maximum token count that may use the MC2 path.
+
+    On A3, the MC2 dispatch operator rejects xDim0 > 512. xDim0 corresponds to
+    the tokens handled by each TP rank, so graph/profile capacities must be
+    capped before selecting MC2 or constructing MC2 metadata.
+    """
+    compilation_config = vllm_config.compilation_config
+    if compilation_config.cudagraph_capture_sizes:
+        max_num_tokens = compilation_config.max_cudagraph_capture_size
+    else:
+        # NOTE: To save memory, we cap the max number of tokens to 512.
+        max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
+
+    if get_ascend_device_type() == AscendDeviceType.A3:
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        max_num_tokens = min(max_num_tokens, tp_size * A3_MC2_MAX_TOKENS_PER_TP_RANK)
+    return max_num_tokens
+
+
 @contextmanager
 def set_ascend_forward_context(
     attn_metadata: Any,
@@ -70,7 +97,12 @@ def set_ascend_forward_context(
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
         max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
-        moe_comm_type = select_moe_comm_method(max_num_tokens, vllm_config, is_draft_model)
+        moe_comm_type = select_moe_comm_method(
+            max_num_tokens,
+            vllm_config,
+            is_draft_model,
+            aclgraph_runtime_mode=aclgraph_runtime_mode,
+        )
 
         forward_context.moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
@@ -171,11 +203,7 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     global _mc2_tokens_capacity
     if _mc2_tokens_capacity is not None:
         return
-    if vllm_config.compilation_config.cudagraph_capture_sizes:
-        max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
-    else:
-        # NOTE: To save memory, we cap the max number of tokens to 512.
-        max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
+    max_num_tokens = get_mc2_max_num_tokens(vllm_config, max_num_reqs, uniform_decode_query_len)
     tp_size = vllm_config.parallel_config.tensor_parallel_size
     # Use integer arithmetic for ceiling division.
     num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
@@ -200,7 +228,12 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
-def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
+def select_moe_comm_method(
+    num_tokens: int,
+    vllm_config: VllmConfig,
+    is_draft_model: bool = False,
+    aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
 
@@ -270,6 +303,12 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
                 fused_prefill_enable = False
             moe_comm_type = MoECommType.FUSED_MC2 if fused_prefill_enable else MoECommType.ALLTOALL
+            if moe_comm_type == MoECommType.ALLTOALL and aclgraph_runtime_mode != CUDAGraphMode.NONE:
+                # AllToAllV currently materializes split sizes on the host, which
+                # is not legal during ACL graph capture on Ascend. Keep eager
+                # behavior unchanged and only switch graph-enabled large-prefill
+                # runs to the graph-safe all-gather path.
+                moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType._310P}:
         moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType.A5}:

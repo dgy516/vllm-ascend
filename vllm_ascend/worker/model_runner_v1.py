@@ -2538,9 +2538,16 @@ class NPUModelRunner(GPUModelRunner):
     def profile_run(self) -> None:
         self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
-        if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
-            mc2_tokens_capacity, self.vllm_config
-        ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+        cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
+        if (
+            cudagraph_mode == CUDAGraphMode.NONE
+            and self.max_num_tokens > mc2_tokens_capacity
+            and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
+            in {MoECommType.MC2, MoECommType.FUSED_MC2}
+        ):
+            # This pre-profile dummy run only warms up the small-token MC2 path.
+            # Large-token graph-enabled prefill requests do not use that path, and
+            # capturing it under FULL graph can fail inside the MC2 dispatch op.
             self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
         origin_max_num_tokens = self.max_num_tokens
         # in the pcp scenario, the split sequence needs to be used for profile run
@@ -3380,6 +3387,7 @@ def _torch_cuda_wrapper():
         torch.cuda.current_stream = torch.npu.current_stream
         torch.cuda.stream = torch.npu.stream
         torch.cuda.synchronize = torch.npu.synchronize
+        torch.cuda.is_current_stream_capturing = torch.npu.is_current_stream_capturing
         torch.cuda.mem_get_info = torch.npu.mem_get_info
         yield
     except Exception as e:
@@ -3389,6 +3397,7 @@ def _torch_cuda_wrapper():
         torch.cuda.current_stream = _StreamPlaceholder
         torch.cuda.stream = _StreamPlaceholder
         torch.cuda.synchronize = _StreamPlaceholder
+        torch.cuda.is_current_stream_capturing = lambda: False
         torch.cuda.mem_get_info = _StreamPlaceholder
         raise RuntimeError(f"NPUModelRunner init failed, error is {e}")
     finally:
@@ -3399,6 +3408,7 @@ def _torch_cuda_wrapper():
         torch.cuda.current_stream = torch.npu.current_stream
         torch.cuda.stream = torch.npu.stream
         torch.cuda.synchronize = torch.npu.synchronize
+        torch.cuda.is_current_stream_capturing = torch.npu.is_current_stream_capturing
         torch.cuda.mem_get_info = torch.npu.mem_get_info
 
 
