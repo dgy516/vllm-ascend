@@ -70,6 +70,7 @@ def set_ascend_forward_context(
     batch_descriptor: BatchDescriptor | None = None,
     model_instance: torch.nn.Module = None,
     is_draft_model=False,
+    prefer_alltoall_for_small_prefill: bool = False,
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
@@ -102,6 +103,7 @@ def set_ascend_forward_context(
             vllm_config,
             is_draft_model,
             aclgraph_runtime_mode=aclgraph_runtime_mode,
+            prefer_alltoall_for_small_prefill=prefer_alltoall_for_small_prefill,
         )
 
         forward_context.moe_comm_type = moe_comm_type
@@ -233,6 +235,7 @@ def select_moe_comm_method(
     vllm_config: VllmConfig,
     is_draft_model: bool = False,
     aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    prefer_alltoall_for_small_prefill: bool = False,
 ) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
@@ -286,16 +289,19 @@ def select_moe_comm_method(
         fused_mc2_enable = envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2
         dispatch_ffn_combine_enable = get_ep_group().world_size <= 32 and (not is_draft_model)
         if num_tokens <= mc2_tokens_capacity:
-            fused_decode_enable = fused_mc2_enable
-            if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
-                fused_decode_enable = fused_mc2_enable and dispatch_ffn_combine_enable
-            elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
-                fused_decode_enable = (
-                    fused_mc2_enable
-                    and speculative_enable_dispatch_gmm_combine_decode(vllm_config)
-                    and quant_type == "w8a8_dynamic"
-                )
-            moe_comm_type = MoECommType.FUSED_MC2 if fused_decode_enable else MoECommType.MC2
+            if prefer_alltoall_for_small_prefill and aclgraph_runtime_mode == CUDAGraphMode.NONE:
+                moe_comm_type = MoECommType.ALLTOALL
+            else:
+                fused_decode_enable = fused_mc2_enable
+                if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+                    fused_decode_enable = fused_mc2_enable and dispatch_ffn_combine_enable
+                elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
+                    fused_decode_enable = (
+                        fused_mc2_enable
+                        and speculative_enable_dispatch_gmm_combine_decode(vllm_config)
+                        and quant_type == "w8a8_dynamic"
+                    )
+                moe_comm_type = MoECommType.FUSED_MC2 if fused_decode_enable else MoECommType.MC2
         else:
             fused_prefill_enable = fused_mc2_enable
             if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:

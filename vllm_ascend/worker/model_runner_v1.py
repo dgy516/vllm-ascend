@@ -1377,6 +1377,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
+                prefer_alltoall_for_small_prefill=self.with_prefill,
                 skip_compiled=has_encoder_input,
             ),
             self.maybe_get_kv_connector_output(
@@ -2488,6 +2489,7 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
+                prefer_alltoall_for_small_prefill=with_prefill,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -2542,7 +2544,11 @@ class NPUModelRunner(GPUModelRunner):
         if (
             cudagraph_mode == CUDAGraphMode.NONE
             and self.max_num_tokens > mc2_tokens_capacity
-            and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
+            and select_moe_comm_method(
+                mc2_tokens_capacity,
+                self.vllm_config,
+                prefer_alltoall_for_small_prefill=True,
+            )
             in {MoECommType.MC2, MoECommType.FUSED_MC2}
         ):
             # This pre-profile dummy run only warms up the small-token MC2 path.
