@@ -80,3 +80,24 @@ class TestAscendForwardContext(TestBase):
         )
 
         self.assertEqual(moe_comm_type, MoECommType.ALLGATHER)
+
+    @patch("vllm_ascend.ascend_forward_context.get_ep_group")
+    @patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True)
+    @patch("vllm_ascend.ascend_forward_context.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    def test_select_moe_comm_method_uses_allgather_for_small_graph_prefill(
+        self,
+        _mock_soc,
+        _mock_is_moe,
+        mock_ep_group,
+    ):
+        vllm_config = self._build_vllm_config()
+        mock_ep_group.return_value.world_size = 8
+        set_mc2_tokens_capacity(vllm_config, max_num_reqs=64, uniform_decode_query_len=1)
+
+        moe_comm_type = select_moe_comm_method(
+            4096,
+            vllm_config,
+            aclgraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        )
+
+        self.assertEqual(moe_comm_type, MoECommType.ALLGATHER)

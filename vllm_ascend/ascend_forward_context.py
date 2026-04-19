@@ -303,12 +303,16 @@ def select_moe_comm_method(
             elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
                 fused_prefill_enable = False
             moe_comm_type = MoECommType.FUSED_MC2 if fused_prefill_enable else MoECommType.ALLTOALL
-            if moe_comm_type == MoECommType.ALLTOALL and aclgraph_runtime_mode != CUDAGraphMode.NONE:
-                # AllToAllV currently materializes split sizes on the host, which
-                # is not legal during ACL graph capture on Ascend. Keep eager
-                # behavior unchanged and only switch graph-enabled large-prefill
-                # runs to the graph-safe all-gather path.
-                moe_comm_type = MoECommType.ALLGATHER
+        if aclgraph_runtime_mode != CUDAGraphMode.NONE and moe_comm_type in {
+            MoECommType.MC2,
+            MoECommType.FUSED_MC2,
+            MoECommType.ALLTOALL,
+        }:
+            # Ascend graph capture is not stable on the current A3 MoE dispatch
+            # implementations. Keep eager behavior unchanged and route graph
+            # prefill to the graph-safe all-gather path until the dispatch ops
+            # support capture end to end.
+            moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType._310P}:
         moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType.A5}:
