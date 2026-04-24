@@ -13,6 +13,8 @@ from vllm_ascend.ops.linear import (AscendMergedColumnParallelLinear,
                                     AscendReplicatedLinear,
                                     AscendRowParallelLinear,
                                     AscendUnquantizedLinearMethod)
+from vllm_ascend.ops.linear_op import (SequenceColumnParallelOp,
+                                       _maybe_all_gather_and_maybe_unpad_with_cache)
 
 
 class BaseLinearTest(unittest.TestCase):
@@ -158,6 +160,60 @@ class TestAscendReplicatedLinear(BaseLinearTest):
         )
         self.assertTrue(
             isinstance(linear.quant_method, AscendUnquantizedLinearMethod))
+
+
+class TestLinearOpGatherReuseCache(unittest.TestCase):
+
+    @patch("vllm_ascend.ops.linear_op.get_forward_context")
+    @patch("vllm_ascend.ops.linear_op._EXTRA_CTX")
+    @patch("vllm_ascend.ops.linear_op.torch.ops.vllm.maybe_all_gather_and_maybe_unpad")
+    def test_reuses_all_gather_for_same_input(self, mock_all_gather, mock_extra_ctx, mock_get_forward_context):
+        x = torch.randn(2, 4)
+        gathered = torch.randn(4, 4)
+        mock_get_forward_context.return_value = MagicMock()
+        mock_extra_ctx.all_gather_reuse_cache = {}
+        mock_all_gather.return_value = gathered
+
+        out1 = _maybe_all_gather_and_maybe_unpad_with_cache(x, label=True)
+        out2 = _maybe_all_gather_and_maybe_unpad_with_cache(x, label=True)
+
+        self.assertIs(out1, gathered)
+        self.assertIs(out2, gathered)
+        mock_all_gather.assert_called_once_with(x, label=True)
+
+    @patch("vllm_ascend.ops.linear_op.get_forward_context")
+    @patch("vllm_ascend.ops.linear_op._EXTRA_CTX")
+    @patch("vllm_ascend.ops.linear_op.torch.ops.vllm.maybe_all_gather_and_maybe_unpad")
+    def test_different_views_do_not_share_cache(self, mock_all_gather, mock_extra_ctx, mock_get_forward_context):
+        x = torch.randn(4, 4)
+        x_view = x[:2]
+        mock_get_forward_context.return_value = MagicMock()
+        mock_extra_ctx.all_gather_reuse_cache = {}
+        mock_all_gather.side_effect = [torch.randn(8, 4), torch.randn(4, 4)]
+
+        _maybe_all_gather_and_maybe_unpad_with_cache(x, label=True)
+        _maybe_all_gather_and_maybe_unpad_with_cache(x_view, label=True)
+
+        self.assertEqual(mock_all_gather.call_count, 2)
+
+    @patch("vllm_ascend.ops.linear_op._maybe_all_gather_and_maybe_unpad_with_cache")
+    def test_sequence_column_uses_cached_all_gather(self, mock_all_gather):
+        x = torch.randn(2, 4)
+        gathered_x = torch.randn(4, 4)
+        mock_all_gather.return_value = gathered_x
+
+        op = object.__new__(SequenceColumnParallelOp)
+        op.layer = MagicMock(prefix="model.layers.3.self_attn.qkv_proj")
+        op.bias = None
+        op.skip_bias_add = False
+        op.quant_method = MagicMock()
+        op.quant_method.apply.return_value = torch.randn(2, 4)
+        op.gather_output = False
+
+        SequenceColumnParallelOp.apply_impl(op, x)
+
+        mock_all_gather.assert_called_once_with(x, label=True)
+        op.quant_method.apply.assert_called_once_with(op.layer, gathered_x, None)
 
 
 if __name__ == '__main__':
