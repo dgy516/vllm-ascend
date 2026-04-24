@@ -126,6 +126,7 @@ def set_ascend_forward_context(
 
         forward_context.prefetch_mlp_gate_up_proj = False
         forward_context.prefetch_mlp_down_proj = False
+        forward_context.all_gather_reuse_cache = {}
         forward_context.model_instance = model_instance
         forward_context.is_draft_model = is_draft_model
 
@@ -300,6 +301,7 @@ class _ExtraForwardContextProxy:
         "is_draft_model",
         "prefetch_mlp_gate_up_proj",
         "prefetch_mlp_down_proj",
+        "all_gather_reuse_cache",
         "model_instance",
         "layer_idx",
         "max_tokens_across_dp",
