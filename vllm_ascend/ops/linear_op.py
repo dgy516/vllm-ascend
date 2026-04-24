@@ -51,6 +51,7 @@ import torch_npu
 from torch import nn
 from torch.distributed import ProcessGroup
 from torch.nn.parameter import Parameter
+from vllm.forward_context import get_forward_context
 from vllm.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_reduce,
@@ -123,6 +124,46 @@ class CustomLinearOp:
         if not self.return_bias:
             return output
         return output, output_bias
+
+
+def _is_compile_time() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    return bool(compiler is not None and compiler.is_compiling())
+
+
+def _need_sequence_column_all_gather(layer_prefix: str) -> bool:
+    return not (extract_layer_index(layer_prefix) == 0 and is_vl_model() and "attn" in layer_prefix)
+
+
+def _maybe_all_gather_and_maybe_unpad(input_: torch.Tensor, *, label: bool) -> torch.Tensor:
+    return torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, label=label)
+
+
+def _get_tensor_reuse_cache_key(input_: torch.Tensor, *, label: bool) -> tuple[int, bool]:
+    return (id(input_), label)
+
+
+def _maybe_all_gather_and_maybe_unpad_with_cache(input_: torch.Tensor, *, label: bool) -> torch.Tensor:
+    if not label or _is_compile_time():
+        return _maybe_all_gather_and_maybe_unpad(input_, label=label)
+
+    try:
+        get_forward_context()
+        cache = _EXTRA_CTX.all_gather_reuse_cache
+    except (AssertionError, AttributeError, KeyError):
+        cache = None
+
+    if cache is None:
+        return _maybe_all_gather_and_maybe_unpad(input_, label=label)
+
+    cache_key = _get_tensor_reuse_cache_key(input_, label=label)
+    cached_output = cache.get(cache_key)
+    if cached_output is not None:
+        return cached_output
+
+    gathered_input = _maybe_all_gather_and_maybe_unpad(input_, label=label)
+    cache[cache_key] = gathered_input
+    return gathered_input
 
 
 class CustomColumnParallelOp(CustomLinearOp):
@@ -432,9 +473,9 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
 
         # Matrix multiply.
         assert self.quant_method is not None
-        need_all_gather = not (extract_layer_index(self.layer.prefix) == 0 and is_vl_model() and "attn" in self.prefix)
-        input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, label=need_all_gather)
-        output_parallel = self.quant_method.apply(self.layer, input_, bias)
+        need_all_gather = _need_sequence_column_all_gather(self.layer.prefix)
+        gathered_input = _maybe_all_gather_and_maybe_unpad_with_cache(input_, label=need_all_gather)
+        output_parallel = self.quant_method.apply(self.layer, gathered_input, bias)
 
         if self.gather_output:
             # All-gather across the partitions.
