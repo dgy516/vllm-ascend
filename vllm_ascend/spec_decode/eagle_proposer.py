@@ -170,6 +170,62 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         self.token_arange_np = np.arange(self.max_num_tokens + 1)
 
+    def _uses_draft_vocab_remapping(self) -> bool:
+        return hasattr(self.model, "draft_id_to_target_id") and self.model.draft_id_to_target_id is not None
+
+    def _can_use_local_argmax_reduction(self) -> bool:
+        return (
+            self.use_local_argmax_reduction
+            and not lmhead_tp_enable()
+            and not self._uses_draft_vocab_remapping()
+        )
+
+    def _validate_local_argmax_reduction(self) -> None:
+        if not self.use_local_argmax_reduction:
+            return
+
+        if lmhead_tp_enable():
+            logger.warning(
+                "use_local_argmax_reduction is enabled but lmhead tensor "
+                "parallel is enabled. Falling back to full logits argmax."
+            )
+            return
+
+        if self._uses_draft_vocab_remapping():
+            logger.warning(
+                "use_local_argmax_reduction is enabled but draft model uses "
+                "draft_id_to_target_id vocab remapping. Falling back to full "
+                "logits argmax."
+            )
+            return
+
+        if not hasattr(self.model, "get_top_tokens"):
+            raise ValueError(
+                "use_local_argmax_reduction is enabled but draft model "
+                f"{self.model.__class__.__name__} does not implement "
+                "get_top_tokens()."
+            )
+
+        logger.info(
+            "Using local argmax reduction for draft token generation "
+            "(communication: O(2*tp_size) vs O(vocab_size))."
+        )
+
+    def _draft_argmax(self, hidden_states: torch.Tensor, num_indices: int) -> torch.Tensor:
+        if self._can_use_local_argmax_reduction():
+            if not hasattr(self.model, "get_top_tokens"):
+                raise ValueError(
+                    "use_local_argmax_reduction is enabled but draft model "
+                    f"{self.model.__class__.__name__} does not implement "
+                    "get_top_tokens()."
+                )
+            return self.model.get_top_tokens(hidden_states)
+
+        logits = self.model.compute_logits(hidden_states)
+        if lmhead_tp_enable() and num_indices < logits.shape[0]:
+            logits = logits[:num_indices]
+        return logits.argmax(dim=-1)
+
     def _get_model(self) -> nn.Module:
         """
         Default method to call get_model(). Can be overridden by subclasses which
@@ -231,6 +287,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         # share embed_tokens with the target model if needed
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(model)
+        self._validate_local_argmax_reduction()
 
         if self.parallel_drafting and self.pass_hidden_states_to_model:
             assert self.parallel_drafting_hidden_state_tensor is not None
@@ -781,13 +838,9 @@ class SpecDecodeBaseProposer(EagleProposer):
             )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
-        logits = self.model.compute_logits(sample_hidden_states)
-
-        if lmhead_tp_enable() and num_indices < logits.shape[0]:
-            logits = logits[:num_indices]
+        draft_token_ids = self._draft_argmax(sample_hidden_states, num_indices)
+        if lmhead_tp_enable() and num_indices < token_indices_to_sample.shape[0]:
             token_indices_to_sample = token_indices_to_sample[:num_indices]
-
-        draft_token_ids = logits.argmax(dim=-1)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -795,7 +848,6 @@ class SpecDecodeBaseProposer(EagleProposer):
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.pcp_size * self.dcp_size > 1 and is_prefill:
-            draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list = []
             for _ in range(self.num_speculative_tokens):
                 draft_token_ids_list.append(draft_token_ids)
@@ -906,15 +958,12 @@ class SpecDecodeBaseProposer(EagleProposer):
                 )
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
-            logits = self.model.compute_logits(sample_hidden_states)
-
-            if lmhead_tp_enable() and num_indices < logits.shape[0]:
-                logits = logits[:num_indices]
+            draft_token_ids = self._draft_argmax(sample_hidden_states, num_indices)
+            if lmhead_tp_enable() and num_indices < token_indices_to_sample.shape[0]:
                 token_indices_to_sample = token_indices_to_sample[:num_indices]
 
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
 
         # [batch_size, num_speculative_tokens]

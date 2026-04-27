@@ -576,7 +576,21 @@
 #    Future Plan:
 #       Remove this patch when all ops in _forward_core support both Qwen3_5 and Qwen3Next.
 #
-# ** 20. File: worker/patch_cudagraph.py**
+# ** 20. File: worker/patch_qwen3_mtp_local_argmax.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.model_executor.models.qwen3_5_mtp.Qwen3_5MTP.get_top_tokens`
+#      `vllm.model_executor.models.qwen3_next_mtp.Qwen3NextMTP.get_top_tokens`
+#    Why:
+#       Upstream MTP local argmax reduction requires draft models to expose
+#       `get_top_tokens()`, but Qwen3 MTP models only expose `compute_logits()`.
+#    How:
+#       Reuse `LogitsProcessor.get_top_tokens()` so MTP greedy draft selection
+#       can avoid all-gathering full-vocab logits when
+#       `use_local_argmax_reduction=True`.
+#    Future Plan:
+#       Remove this patch when upstream Qwen3 MTP models expose `get_top_tokens()`.
+#
+# ** 21. File: worker/patch_cudagraph.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.cudagraph_dispatcher.CudagraphDispatcher._create_padded_batch_descriptor`
 #    Why:
@@ -590,7 +604,7 @@
 #    Future Plan:
 #       Remove this patch when vLLM merges the PR.
 #
-# ** 21. File: worker/patch_deepseek_mtp.py**
+# ** 22. File: worker/patch_deepseek_mtp.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.deepseek_v2.get_spec_layer_idx_from_weight_name` and
 #      `vllm.model_executor.models.deepseek_mtp.get_spec_layer_idx_from_weight_name`
@@ -621,7 +635,7 @@
 #       Rotary quant is a unique feature of vllm-ascend.
 #    Future Plan:
 #       Remove this patch when vllm supports rotary quant or pluggable `MultiTokenPredictorLayer`.
-# ** 22. File: worker/patch_mamba_utils.py**
+# ** 23. File: worker/patch_mamba_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.mamba_utils.batch_memcpy_kernel = batch_memcpy_kernel`
 #    Why:
