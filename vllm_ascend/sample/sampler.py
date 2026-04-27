@@ -1,4 +1,5 @@
 import torch
+import torch_npu
 from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -7,9 +8,16 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.sample.penalties import apply_all_penalties
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_stream, npu_stream_switch
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_ascend_device_type,
+    global_stream,
+    npu_stream_switch,
+)
 
 DEFAULT_LOGPROBS_MODE = "raw_logprobs"
+NPU_TOP_K_TOP_P_SAMPLE_SUPPORTED_DEVICES = [AscendDeviceType.A2, AscendDeviceType.A3]
+PROCESSED_LOGPROBS_MODES = ("processed_logits", "processed_logprobs")
 
 
 def random_sample(
@@ -38,6 +46,23 @@ def random_sample(
     return probs.div_(q).argmax(dim=-1).view(-1)
 
 
+def generate_random_q(
+    shape: torch.Size,
+    device: torch.device,
+    generators: dict[int, torch.Generator],
+) -> torch.Tensor:
+    """Generate exponential randoms for device-side sampling."""
+    with npu_stream_switch(global_stream()):
+        q = torch.empty(shape, device=device, dtype=torch.float32)
+        if len(generators) != q.shape[0]:
+            q.exponential_()
+        if generators:
+            for i, generator in generators.items():
+                q[i].exponential_(generator=generator)
+    torch.npu.current_stream().wait_stream(global_stream())
+    return q
+
+
 class AscendSampler(Sampler):
     @staticmethod
     def apply_penalties(
@@ -64,7 +89,9 @@ class AscendSampler(Sampler):
     def __init__(self, logprobs_mode=DEFAULT_LOGPROBS_MODE):
         # TODO: support logprobs_mode in vllm-ascend
         super().__init__(logprobs_mode=logprobs_mode)
-        self.topk_topp_sampler = AscendTopKTopPSampler()
+        self.topk_topp_sampler = AscendTopKTopPSampler(
+            logprobs_mode=logprobs_mode,
+        )
         self.async_exponential_event = torch.npu.Event()
 
     def set_q_event(self, q, event):
@@ -97,12 +124,101 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         self.q = q
         self.async_event = event
 
+    @staticmethod
+    def _can_use_npu_top_k_top_p_sample() -> bool:
+        return (
+            get_ascend_device_type() in NPU_TOP_K_TOP_P_SAMPLE_SUPPORTED_DEVICES
+            and hasattr(torch_npu, "npu_top_k_top_p_sample")
+        )
+
+    @staticmethod
+    def _prepare_npu_top_k_top_p_inputs(
+        logits: torch.Tensor,
+        k: torch.Tensor | None,
+        p: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # npu_top_k_top_p_sample supports fp16/bf16 logits only. Sampler logits
+        # are usually promoted to fp32 by vLLM before reaching this layer.
+        if logits.dtype in (torch.float16, torch.bfloat16):
+            sample_logits = logits
+        else:
+            sample_logits = logits.to(torch.bfloat16)
+
+        batch_size, vocab_size = sample_logits.shape
+        if k is None:
+            sample_k = torch.full(
+                (batch_size,),
+                vocab_size,
+                dtype=torch.int32,
+                device=sample_logits.device,
+            )
+        else:
+            sample_k = k.to(device=sample_logits.device, dtype=torch.int32)
+
+        if p is None:
+            sample_p = torch.ones(
+                (batch_size,),
+                dtype=sample_logits.dtype,
+                device=sample_logits.device,
+            )
+        else:
+            sample_p = p.to(
+                device=sample_logits.device,
+                dtype=sample_logits.dtype,
+            )
+        return sample_logits, sample_k, sample_p
+
+    def _sample_with_npu_top_k_top_p(
+        self,
+        logits: torch.Tensor,
+        generators: dict[int, torch.Generator],
+        k: torch.Tensor | None,
+        p: torch.Tensor | None,
+        q: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        sample_logits, sample_k, sample_p = (
+            self._prepare_npu_top_k_top_p_inputs(logits, k, p)
+        )
+        if q is None:
+            q = generate_random_q(
+                sample_logits.shape,
+                sample_logits.device,
+                generators,
+            )
+        sampled_token_ids, _ = torch_npu.npu_top_k_top_p_sample(
+            sample_logits,
+            sample_k,
+            sample_p,
+            q,
+        )
+        return sampled_token_ids.view(-1)
+
     def forward_native(self, logits, generators, k, p):
         """Override pytorch native implementation to torch_npu"""
         # when batch_invariant mode is enabled, we should use vllm's implementation.
         # or it will make batch_invariant mode not working.
         if vllm_is_batch_invariant():
             return super().forward_native(logits, generators, k, p)
+
+        if (self.logprobs_mode not in PROCESSED_LOGPROBS_MODES
+                and self._can_use_npu_top_k_top_p_sample()):
+            if get_ascend_config().enable_async_exponential:
+                # Add synchronize to prevent synchronize error.
+                self.async_event.synchronize()
+                return self._sample_with_npu_top_k_top_p(
+                    logits,
+                    generators,
+                    k,
+                    p,
+                    self.q,
+                ), None
+            return self._sample_with_npu_top_k_top_p(
+                logits,
+                generators,
+                k,
+                p,
+            ), None
+
         logits = self.apply_top_k_top_p(logits, k, p)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
