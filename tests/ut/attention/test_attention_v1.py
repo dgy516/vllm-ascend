@@ -500,6 +500,40 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.assertEqual(tuple(expanded_block_tables.shape), (8, 1))
         self.assertEqual(expanded_seq_lens, [0, 0, 0, 0, 0, 1, 2, 3])
 
+    def test_c8_bnsd_decode_metadata_cache_reuses_expanded_metadata(self):
+        metadata = MagicMock()
+        metadata.c8_bnsd_decode_metadata_cache = None
+        block_tables = torch.zeros((2, 1), dtype=torch.int32)
+        original_expand = AscendAttentionBackendImpl._expand_c8_bnsd_decode_metadata
+
+        with patch.object(
+            AscendAttentionBackendImpl,
+            "_expand_c8_bnsd_decode_metadata",
+            side_effect=original_expand,
+        ) as mock_expand:
+            first_block_tables, first_seq_lens = AscendAttentionBackendImpl._get_or_create_c8_bnsd_decode_metadata(
+                metadata,
+                block_tables,
+                [10, 20],
+                [4, 8],
+                num_tokens=8,
+                num_seqs=2,
+            )
+            second_block_tables, second_seq_lens = AscendAttentionBackendImpl._get_or_create_c8_bnsd_decode_metadata(
+                metadata,
+                block_tables,
+                [10, 20],
+                [4, 8],
+                num_tokens=8,
+                num_seqs=2,
+            )
+
+        self.assertEqual(mock_expand.call_count, 1)
+        self.assertIs(first_block_tables, second_block_tables)
+        self.assertIs(first_seq_lens, second_seq_lens)
+        self.assertEqual(tuple(first_block_tables.shape), (8, 1))
+        self.assertEqual(first_seq_lens, [7, 8, 9, 10, 17, 18, 19, 20])
+
     def test_c8_prepare_scales_expands_scalar_dummy_scales(self):
         impl = object.__new__(AscendC8AttentionBackendImpl)
         impl.num_kv_heads = 1

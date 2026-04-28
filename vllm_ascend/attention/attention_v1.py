@@ -201,6 +201,9 @@ class AscendMetadata:
 
     # sliding window attention mask
     swa_mask: torch.Tensor | None = None
+    # Cached token-as-batch metadata for C8 BNSD decode. The cache is
+    # per-step and avoids rebuilding expanded block tables once per layer.
+    c8_bnsd_decode_metadata_cache: dict | None = None
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -436,6 +439,47 @@ class AscendAttentionBackendImpl(AttentionImpl):
         return expanded_block_tables, expanded_seq_lens
 
     @staticmethod
+    def _get_or_create_c8_bnsd_decode_metadata(
+        attn_metadata: AscendMetadata | None,
+        block_tables: torch.Tensor | None,
+        seq_lens: list[int] | torch.Tensor | None,
+        actual_seq_lengths_q: list[int] | None,
+        num_tokens: int,
+        num_seqs: int,
+    ) -> tuple[torch.Tensor | None, list[int] | torch.Tensor | None]:
+        if attn_metadata is None:
+            return AscendAttentionBackendImpl._expand_c8_bnsd_decode_metadata(
+                block_tables,
+                seq_lens,
+                actual_seq_lengths_q,
+                num_tokens,
+                num_seqs,
+            )
+
+        cache = getattr(attn_metadata, "c8_bnsd_decode_metadata_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            attn_metadata.c8_bnsd_decode_metadata_cache = cache
+
+        q_key = tuple(int(q_len) for q_len in (actual_seq_lengths_q or [])[:num_seqs])
+        if isinstance(seq_lens, torch.Tensor):
+            seq_lens_key = tuple(int(seq_len) for seq_len in seq_lens[:num_seqs].tolist())
+        else:
+            seq_lens_key = tuple(int(seq_len) for seq_len in (seq_lens or [])[:num_seqs])
+        block_shape = tuple(block_tables.shape) if block_tables is not None else ()
+        cache_key = (num_tokens, num_seqs, q_key, seq_lens_key, block_shape)
+
+        if cache_key not in cache:
+            cache[cache_key] = AscendAttentionBackendImpl._expand_c8_bnsd_decode_metadata(
+                block_tables,
+                seq_lens,
+                actual_seq_lengths_q,
+                num_tokens,
+                num_seqs,
+            )
+        return cache[cache_key]
+
+    @staticmethod
     def update_graph_params(
         update_stream,
         forward_context,
@@ -570,21 +614,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
                     if _EXTRA_CTX.is_draft_model:
                         draft_step = attn_count // num_layers
-                        seq_lens = attn_metadata[draft_step][key].seq_lens_list
-                        actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
-                        block_tables = attn_metadata[draft_step][key].block_tables
+                        layer_attn_metadata = attn_metadata[draft_step][key]
+                        seq_lens = layer_attn_metadata.seq_lens_list
+                        actual_seq_lengths_q = layer_attn_metadata.actual_seq_lengths_q
+                        block_tables = layer_attn_metadata.block_tables
                         attn_count = attn_count + 1
                     else:
-                        seq_lens = attn_metadata[key].seq_lens_list
-                        actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
-                        block_tables = attn_metadata[key].block_tables
+                        layer_attn_metadata = attn_metadata[key]
+                        seq_lens = layer_attn_metadata.seq_lens_list
+                        actual_seq_lengths_q = layer_attn_metadata.actual_seq_lengths_q
+                        block_tables = layer_attn_metadata.block_tables
 
                     input_layout = "TND"
                     sparse_mode = 3
                     extra_args = {}
                     if c8_k_aq_scale is not None:
                         num_seqs = len(seq_lens) if seq_lens is not None else 0
-                        block_tables, seq_lens = AscendAttentionBackendImpl._expand_c8_bnsd_decode_metadata(
+                        block_tables, seq_lens = AscendAttentionBackendImpl._get_or_create_c8_bnsd_decode_metadata(
+                            layer_attn_metadata,
                             block_tables,
                             seq_lens,
                             actual_seq_lengths_q,
@@ -658,6 +705,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
         extra_args = {}
         c8_params = ()
         if layer is not None and hasattr(layer, "_c8_k_aq_scale"):
+            num_seqs = len(actual_seq_lengths_kv) if actual_seq_lengths_kv is not None else 0
+            input_layout = "BNSD"
+            block_table, actual_seq_lengths_kv = self._get_or_create_c8_bnsd_decode_metadata(
+                attn_metadata,
+                block_table,
+                actual_seq_lengths_kv,
+                actual_seq_lengths_q,
+                num_tokens,
+                num_seqs,
+            )
+            actual_seq_lengths_q = None
+            query = query[:num_tokens].unsqueeze(2)
+            output = output[:num_tokens].unsqueeze(2)
+            attn_mask = None
+            sparse_mode = 0
             extra_args = {
                 "key_antiquant_scale": layer._c8_k_aq_scale,
                 "key_antiquant_offset": layer._c8_k_aq_offset,
@@ -672,20 +734,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 weak_ref_tensors(layer._c8_v_aq_scale),
                 weak_ref_tensors(layer._c8_v_aq_offset),
             )
-            input_layout = "BNSD"
-            num_seqs = len(actual_seq_lengths_kv) if actual_seq_lengths_kv is not None else 0
-            block_table, actual_seq_lengths_kv = self._expand_c8_bnsd_decode_metadata(
-                block_table,
-                actual_seq_lengths_kv,
-                actual_seq_lengths_q,
-                num_tokens,
-                num_seqs,
-            )
-            actual_seq_lengths_q = None
-            query = query[:num_tokens].unsqueeze(2)
-            output = output[:num_tokens].unsqueeze(2)
-            attn_mask = None
-            sparse_mode = 0
 
         # Get workspace from cache or calculate it if not present.
         workspace = graph_params.workspaces.get(num_tokens)
@@ -1326,14 +1374,14 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             if getattr(attn_metadata, "actual_seq_lengths_q", None)
             else query.shape[0]
         )
-        block_tables, seq_lens = self._expand_c8_bnsd_decode_metadata(
+        block_tables, seq_lens = self._get_or_create_c8_bnsd_decode_metadata(
+            attn_metadata,
             attn_metadata.block_tables,
             attn_metadata.seq_lens_list,
             getattr(attn_metadata, "actual_seq_lengths_q", None),
             num_decode_tokens,
             batch_size,
         )
-
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query[:num_decode_tokens].unsqueeze(2),
             key,
@@ -1377,14 +1425,14 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             )
             kv_k = self.key_cache.view(num_block, block_size, -1)  # type: ignore[attr-defined]
             kv_v = self.value_cache.view(num_block, block_size, -1)  # type: ignore[attr-defined]
-            block_tables, seq_lens = self._expand_c8_bnsd_decode_metadata(
+            block_tables, seq_lens = self._get_or_create_c8_bnsd_decode_metadata(
+                attn_metadata,
                 attn_metadata.block_tables[:num_decodes],
                 attn_metadata.seq_lens_list[:num_decodes],
                 actual_seq_qlen[:num_decodes],
                 num_decode_tokens,
                 num_decodes,
             )
-
             attn_out, _ = torch_npu.npu_fused_infer_attention_score(
                 query[:num_decode_tokens].unsqueeze(2),
                 kv_k,
