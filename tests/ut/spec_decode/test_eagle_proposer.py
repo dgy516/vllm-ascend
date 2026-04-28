@@ -138,6 +138,33 @@ class TestEagleProposerInitialization(TestBase):
             expected_max_num_tokens = proposer.max_num_tokens
             self.assertEqual(proposer.hidden_states.shape, (expected_max_num_tokens, 2048))
 
+    @patch("vllm_ascend.spec_decode.eagle_proposer.torch.npu.Stream")
+    @patch("vllm_ascend.spec_decode.eagle_proposer.ACLGraphWrapper")
+    def test_mtp_full_graph_wraps_merged_draft_runnable(self, mock_acl_wrapper,
+                                                        mock_stream):
+        proposer = object.__new__(AscendEagleProposer)
+        proposer.method = "mtp"
+        proposer.model = MagicMock()
+        proposer._run_merged_draft = MagicMock()
+        proposer.vllm_config = MagicMock()
+        proposer.vllm_config.model_config.is_deepseek_mla = False
+        proposer.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs.return_value = True
+        proposer.use_cuda_graph = True
+
+        wrapped = MagicMock()
+        mock_acl_wrapper.return_value = wrapped
+        target_model = MagicMock()
+
+        proposer._maybe_share_lm_head(target_model)
+
+        mock_stream.assert_called_once()
+        mock_acl_wrapper.assert_called_once_with(
+            proposer._run_merged_draft,
+            proposer.vllm_config,
+            runtime_mode=CUDAGraphMode.FULL)
+        self.assertIs(proposer._runnable, wrapped)
+        self.assertIsNot(proposer.model, wrapped)
+
 @unittest.skip("Skip due to the changes in #7153, fix me later")
 class TestEagleProposerLoadModel(TestBase):
     def setUp(self):

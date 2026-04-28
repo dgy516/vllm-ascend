@@ -4,6 +4,7 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend.attention.attention_v1 import (AscendAttentionBackend,
+                                                AscendC8AttentionBackendImpl,
                                                 AscendAttentionBackendImpl,
                                                 AscendAttentionMetadataBuilder,
                                                 AscendAttentionState)
@@ -348,3 +349,174 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_fused_infer_attention_score.assert_called_once()
 
         assert output.shape == (10, 8, 64)
+
+    @patch('torch_npu.npu_fused_infer_attention_score')
+    def test_c8_decode_passes_antiquant_scales_to_fia(self, mock_fia):
+        impl = object.__new__(AscendC8AttentionBackendImpl)
+        impl.num_heads = 2
+        impl.num_kv_heads = 1
+        impl.head_size = 8
+        impl.scale = 0.125
+        impl.key_cache = torch.zeros((4, 32, 1, 8), dtype=torch.int8)
+        impl.value_cache = torch.zeros((4, 32, 1, 8), dtype=torch.int8)
+
+        layer = MagicMock()
+        layer._c8_k_aq_scale = torch.ones((1, 1, 1, 8), dtype=torch.float32)
+        layer._c8_k_aq_offset = torch.zeros((1, 1, 1, 8), dtype=torch.float32)
+        layer._c8_v_aq_scale = torch.ones((1, 1, 1, 8), dtype=torch.float32)
+        layer._c8_v_aq_offset = torch.zeros((1, 1, 1, 8), dtype=torch.float32)
+
+        metadata = MagicMock()
+        metadata.actual_seq_lengths_q = [4, 8]
+        metadata.seq_lens_list = [10, 20]
+        metadata.block_tables = torch.zeros((2, 1), dtype=torch.int32)
+        query = torch.zeros((8, 2, 8), dtype=torch.float32)
+        output = torch.empty_like(query)
+        mock_fia.return_value = (torch.ones((8, 2, 1, 8), dtype=torch.float32), None)
+
+        impl._forward_c8_decode(query, metadata, output, layer)
+
+        args = mock_fia.call_args.args
+        kwargs = mock_fia.call_args.kwargs
+        self.assertEqual(tuple(args[0].shape), (8, 2, 1, 8))
+        self.assertEqual(tuple(kwargs["block_table"].shape), (8, 1))
+        self.assertEqual(kwargs["actual_seq_lengths_kv"], [7, 8, 9, 10, 17, 18, 19, 20])
+        self.assertIs(kwargs["key_antiquant_scale"], layer._c8_k_aq_scale)
+        self.assertIs(kwargs["key_antiquant_offset"], layer._c8_k_aq_offset)
+        self.assertIs(kwargs["value_antiquant_scale"], layer._c8_v_aq_scale)
+        self.assertIs(kwargs["value_antiquant_offset"], layer._c8_v_aq_offset)
+        self.assertEqual(kwargs["input_layout"], "BNSD")
+        self.assertEqual(kwargs["key_antiquant_mode"], 0)
+        self.assertEqual(kwargs["value_antiquant_mode"], 0)
+        self.assertTrue(torch.all(output == 1))
+
+    @patch('torch_npu.npu_fused_infer_attention_score')
+    def test_c8_chunked_decode_expands_mtp_metadata(self, mock_fia):
+        impl = object.__new__(AscendC8AttentionBackendImpl)
+        impl.num_heads = 2
+        impl.num_kv_heads = 1
+        impl.head_size = 8
+        impl.scale = 0.125
+        impl.key_cache = torch.zeros((4, 32, 1, 8), dtype=torch.int8)
+        impl.value_cache = torch.zeros((4, 32, 1, 8), dtype=torch.int8)
+
+        layer = MagicMock()
+        layer._c8_k_aq_scale = torch.ones((1, 1, 1, 8), dtype=torch.float32)
+        layer._c8_k_aq_offset = torch.zeros((1, 1, 1, 8), dtype=torch.float32)
+        layer._c8_v_aq_scale = torch.ones((1, 1, 1, 8), dtype=torch.float32)
+        layer._c8_v_aq_offset = torch.zeros((1, 1, 1, 8), dtype=torch.float32)
+
+        metadata = MagicMock()
+        metadata.num_decode_tokens = 8
+        metadata.num_decodes = 2
+        metadata.num_prefills = 0
+        metadata.actual_seq_lengths_q = [4, 8]
+        metadata.seq_lens_list = [10, 20]
+        metadata.block_tables = torch.zeros((2, 1), dtype=torch.int32)
+        query = torch.zeros((8, 2, 8), dtype=torch.float32)
+        output = torch.empty_like(query)
+        mock_fia.return_value = (torch.ones((8, 2, 1, 8), dtype=torch.float32), None)
+
+        impl._forward_c8_chunked_prefill(query, None, None, metadata, output, layer)
+
+        args = mock_fia.call_args.args
+        kwargs = mock_fia.call_args.kwargs
+        self.assertEqual(tuple(args[0].shape), (8, 2, 1, 8))
+        self.assertEqual(tuple(kwargs["block_table"].shape), (8, 1))
+        self.assertEqual(kwargs["actual_seq_lengths_kv"], [7, 8, 9, 10, 17, 18, 19, 20])
+        self.assertTrue(torch.all(output == 1))
+
+    def test_c8_full_graph_uses_token_as_batch_bnsd_decode_shape(self):
+        impl = object.__new__(AscendAttentionBackendImpl)
+        impl.num_heads = 2
+        impl.num_kv_heads = 1
+        impl.head_size = 8
+        impl.scale = 0.125
+
+        key = torch.zeros((4, 32, 8), dtype=torch.int8)
+        value = torch.zeros((4, 32, 8), dtype=torch.int8)
+        block_table = torch.zeros((2, 1), dtype=torch.int32)
+        impl._get_fia_params = MagicMock(return_value=(key, value, 32, block_table, [10, 20]))
+
+        layer = MagicMock()
+        layer._c8_k_aq_scale = torch.ones((1, 1, 1, 8), dtype=torch.float32)
+        layer._c8_k_aq_offset = torch.zeros((1, 1, 1, 8), dtype=torch.float32)
+        layer._c8_v_aq_scale = torch.ones((1, 1, 1, 8), dtype=torch.float32)
+        layer._c8_v_aq_offset = torch.zeros((1, 1, 1, 8), dtype=torch.float32)
+
+        metadata = MagicMock()
+        metadata.actual_seq_lengths_q = [4, 8]
+        metadata.attn_mask = torch.ones((1, 1, 8, 8), dtype=torch.bool)
+        query = torch.zeros((8, 2, 8), dtype=torch.float32)
+        output = torch.empty_like(query)
+
+        graph_params = MagicMock()
+        graph_params.workspaces = {8: None}
+        graph_params.events = {8: []}
+        graph_params.handles = {8: []}
+        graph_params.attn_params = {8: []}
+        mock_stream = MagicMock()
+        mock_event = MagicMock()
+        mock_fia = MagicMock()
+
+        with patch('vllm_ascend.attention.attention_v1._EXTRA_CTX',
+                   MagicMock(is_draft_model=False)), \
+             patch('vllm_ascend.attention.attention_v1.get_graph_params', return_value=graph_params), \
+             patch('vllm_ascend.attention.attention_v1.update_graph_params_workspaces'), \
+             patch('vllm_ascend.attention.attention_v1.weak_ref_tensors', side_effect=lambda tensor: tensor), \
+             patch('torch_npu._npu_fused_infer_attention_score_get_max_workspace',
+                   return_value=torch.empty(1, dtype=torch.float32)), \
+             patch('torch_npu.npu_fused_infer_attention_score', mock_fia), \
+             patch('torch.npu.current_stream', return_value=mock_stream), \
+             patch('torch.npu.ExternalEvent', return_value=mock_event), \
+             patch('torch.npu.graph_task_group_begin'), \
+             patch('torch.npu.graph_task_group_end', return_value='handle'):
+            attn_output, num_tokens = impl.full_graph_fia(query, key, value, metadata, output, layer)
+
+        kwargs = mock_fia.out.call_args.kwargs
+        self.assertEqual(num_tokens, 8)
+        self.assertEqual(tuple(kwargs["query"].shape), (8, 2, 1, 8))
+        self.assertEqual(tuple(kwargs["block_table"].shape), (8, 1))
+        self.assertEqual(kwargs["actual_seq_lengths"], None)
+        self.assertEqual(kwargs["actual_seq_lengths_kv"], [7, 8, 9, 10, 17, 18, 19, 20])
+        self.assertEqual(kwargs["input_layout"], "BNSD")
+        self.assertEqual(kwargs["sparse_mode"], 0)
+        self.assertIs(kwargs["key_antiquant_scale"], layer._c8_k_aq_scale)
+        self.assertEqual(tuple(attn_output.shape), (8, 2, 8))
+
+    def test_c8_bnsd_decode_metadata_clamps_padded_seq_lens(self):
+        block_tables = torch.zeros((2, 1), dtype=torch.int32)
+
+        expanded_block_tables, expanded_seq_lens = (
+            AscendAttentionBackendImpl._expand_c8_bnsd_decode_metadata(
+                block_tables,
+                [0, 3],
+                [4, 8],
+                num_tokens=8,
+                num_seqs=2,
+            )
+        )
+
+        self.assertEqual(tuple(expanded_block_tables.shape), (8, 1))
+        self.assertEqual(expanded_seq_lens, [0, 0, 0, 0, 0, 1, 2, 3])
+
+    def test_c8_prepare_scales_expands_scalar_dummy_scales(self):
+        impl = object.__new__(AscendC8AttentionBackendImpl)
+        impl.num_kv_heads = 1
+        impl.head_size = 8
+
+        class Layer:
+            pass
+
+        layer = Layer()
+        layer.k_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+        layer.k_cache_offset = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
+        layer.v_cache_scale = torch.nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+        layer.v_cache_offset = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32), requires_grad=False)
+
+        impl._prepare_c8_scales(layer, torch.device("cpu"))
+
+        self.assertEqual(tuple(layer._c8_k_scale.shape), (1, 1, 8))
+        self.assertEqual(tuple(layer._c8_k_aq_scale.shape), (1, 1, 1, 8))
+        self.assertTrue(torch.all(layer._c8_k_scale == 1))
+        self.assertTrue(torch.all(layer._c8_v_offset == 0))

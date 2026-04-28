@@ -472,6 +472,10 @@ class AscendModelSlimConfig(QuantizationConfig):
         ):
             scheme = create_scheme_for_layer(self.quant_description, prefix, "attention", self.packed_modules_mapping)
             return AscendKVCacheMethod(scheme)
+        elif isinstance(layer, AttentionLayerBase) and self.enable_c8_quant:
+            from .methods.kv_c8 import AscendC8KVCacheAttentionMethod
+
+            return AscendKVCacheMethod(AscendC8KVCacheAttentionMethod(self.quant_description, prefix))
         elif isinstance(layer, FusedMoE):
             if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
                 # Delayed import to avoid circular import
@@ -518,17 +522,63 @@ class AscendModelSlimConfig(QuantizationConfig):
 
     def is_fa_quant_layer(self, prefix):
         if self.enable_fa_quant:
-            layer_id_str = "".join(re.findall(r"\.(\d+)\.", prefix))
-            if layer_id_str.isdigit() and int(layer_id_str) in self.kvcache_quant_layers:
+            if self._matches_quant_layer_prefix(prefix, self.kvcache_quant_layer_prefixes):
+                return True
+            if not self.kvcache_quant_layer_prefixes and self._matches_quant_layer_id(
+                prefix, self.kvcache_quant_layers
+            ):
                 return True
         return False
 
     def is_indexer_quant_layer(self, prefix):
         if self.enable_indexer_quant:
-            layer_id_str = "".join(re.findall(r"\.(\d+)\.", prefix))
-            if layer_id_str.isdigit() and int(layer_id_str) in self.indexer_quant_layers:
+            if self._matches_quant_layer_prefix(prefix, self.indexer_quant_layer_prefixes):
+                return True
+            if not self.indexer_quant_layer_prefixes and self._matches_quant_layer_id(
+                prefix, self.indexer_quant_layers
+            ):
                 return True
         return False
+
+    @staticmethod
+    def _matches_quant_layer_id(prefix: str, quant_layer_ids: list[int]) -> bool:
+        layer_id_str = "".join(re.findall(r"\.(\d+)\.", prefix))
+        return layer_id_str.isdigit() and int(layer_id_str) in quant_layer_ids
+
+    @staticmethod
+    def _normalize_quant_prefix(prefix: str) -> str:
+        return prefix.strip(".")
+
+    @classmethod
+    def _prefix_match_candidates(cls, prefix: str) -> list[str]:
+        prefix = cls._normalize_quant_prefix(prefix)
+        candidates = [prefix]
+        if prefix.startswith("model."):
+            candidates.append(prefix[len("model.") :])
+        return candidates
+
+    @classmethod
+    def _is_same_quant_prefix(cls, prefix: str, quant_prefix: str) -> bool:
+        for prefix_candidate in cls._prefix_match_candidates(prefix):
+            for quant_candidate in cls._prefix_match_candidates(quant_prefix):
+                if prefix_candidate == quant_candidate:
+                    return True
+                if prefix_candidate.startswith(quant_candidate + "."):
+                    return True
+                if quant_candidate.startswith(prefix_candidate + "."):
+                    return True
+        return False
+
+    @classmethod
+    def _matches_quant_layer_prefix(cls, prefix: str, quant_prefixes: list[str]) -> bool:
+        return any(cls._is_same_quant_prefix(prefix, quant_prefix) for quant_prefix in quant_prefixes)
+
+    @staticmethod
+    def _quant_layer_prefix_from_key(key: str, marker: str) -> str | None:
+        marker = f".{marker}"
+        if marker not in key:
+            return None
+        return key.split(marker, 1)[0].strip(".")
 
     def enabling_fa_quant(self, vllm_config, layer_name) -> bool:
         is_decode_instance = (
@@ -663,14 +713,25 @@ class AscendModelSlimConfig(QuantizationConfig):
     def _add_kvcache_quant_metadata(self):
         fa_quant_type = self.quant_description.get("fa_quant_type", "")
         self.enable_fa_quant = fa_quant_type != ""
+        self.enable_c8_quant = self.quant_description.get("kv_cache_type") == "C8"
         self.kvcache_quant_layers = []
+        self.kvcache_quant_layer_prefixes = []
         indexer_quant_type = self.quant_description.get("indexer_quant_type", "")
         self.enable_indexer_quant = indexer_quant_type != ""
         self.indexer_quant_layers = []
+        self.indexer_quant_layer_prefixes = []
         if self.enable_fa_quant or self.enable_indexer_quant:
             for key in self.quant_description:
                 _id = "".join(re.findall(r"\.(\d+)\.", key))
                 if "fa_k.scale" in key:
-                    self.kvcache_quant_layers.append(int(_id))
+                    if _id.isdigit():
+                        self.kvcache_quant_layers.append(int(_id))
+                    quant_prefix = self._quant_layer_prefix_from_key(key, "fa_k.scale")
+                    if quant_prefix is not None:
+                        self.kvcache_quant_layer_prefixes.append(quant_prefix)
                 if "indexer.quant_type" in key:
-                    self.indexer_quant_layers.append(int(_id))
+                    if _id.isdigit():
+                        self.indexer_quant_layers.append(int(_id))
+                    quant_prefix = self._quant_layer_prefix_from_key(key, "indexer.quant_type")
+                    if quant_prefix is not None:
+                        self.indexer_quant_layer_prefixes.append(quant_prefix)

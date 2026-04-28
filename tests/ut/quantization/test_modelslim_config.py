@@ -3,6 +3,7 @@ import os
 import tempfile
 from unittest.mock import MagicMock, patch
 
+import torch
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.linear import LinearBase
@@ -13,6 +14,7 @@ from vllm_ascend.quantization.modelslim_config import (
     MODELSLIM_CONFIG_FILENAME,
     AscendModelSlimConfig,
 )
+from vllm_ascend.quantization.methods import get_scheme_class
 from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD
 
 from vllm.model_executor.layers.attention import Attention
@@ -23,8 +25,8 @@ class TestAscendModelSlimConfig(TestBase):
     def setUp(self):
         self.sample_config = {
             "weight": "INT8",
-            "fa_quant_type": "C8",
-            "layers.1.fa_k.scale": "C8",
+            "fa_quant_type": "FAKQuant",
+            "layers.1.fa_k.scale": "FLOAT",
             "layer1.weight": "INT8",
             "layer2.weight": "FLOAT",
             "fused_layer.weight": "FLOAT",
@@ -124,6 +126,81 @@ class TestAscendModelSlimConfig(TestBase):
             method = self.ascend_config.get_quant_method(
                 attention_layer, "layers.1.attn")
             self.assertIs(method, mock_ascend_kvcache.return_value)
+
+    def test_fa_quant_layer_prefix_matching_keeps_mtp_distinct(self):
+        config = AscendModelSlimConfig({
+            "fa_quant_type": "FAKQuant",
+            "model.layers.3.self_attn.fa_k.scale": "FLOAT",
+        })
+
+        self.assertTrue(config.is_fa_quant_layer("model.layers.3.self_attn"))
+        self.assertFalse(config.is_fa_quant_layer("mtp.layers.3.self_attn"))
+        self.assertFalse(config.is_fa_quant_layer("model.layers.7.self_attn"))
+
+    def test_fa_quant_layer_prefix_matching_supports_mtp_fakquant(self):
+        config = AscendModelSlimConfig({
+            "fa_quant_type": "FAKQuant",
+            "mtp.layers.0.self_attn.fa_k.scale": "FLOAT",
+        })
+
+        self.assertTrue(config.is_fa_quant_layer("mtp.layers.0.self_attn"))
+        self.assertFalse(config.is_fa_quant_layer("model.layers.0.self_attn"))
+
+    def test_mtp_fa_quant_layer_uses_int8_kv_dtype(self):
+        config = AscendModelSlimConfig({
+            "fa_quant_type": "FAKQuant",
+            "mtp.layers.0.self_attn.fa_k.scale": "FLOAT",
+        })
+        model_config = MagicMock()
+        model_config.dtype = torch.bfloat16
+        model_config.use_mla = False
+
+        self.assertEqual(
+            config.get_kv_quant_dtype("mtp.layers.0.self_attn",
+                                      torch.bfloat16, model_config),
+            (torch.int8, torch.int8))
+        self.assertEqual(
+            config.get_kv_quant_dtype("model.layers.0.self_attn",
+                                      torch.bfloat16, model_config),
+            (torch.bfloat16, torch.bfloat16))
+
+    def test_fa_quant_layer_prefix_matching_supports_legacy_main_layers(self):
+        config = AscendModelSlimConfig({
+            "fa_quant_type": "FAKQuant",
+            "layers.1.fa_k.scale": "FLOAT",
+        })
+
+        self.assertTrue(config.is_fa_quant_layer("layers.1.attn"))
+        self.assertTrue(config.is_fa_quant_layer("model.layers.1.attn"))
+        self.assertFalse(config.is_fa_quant_layer("mtp.layers.1.attn"))
+
+    def test_fakquant_attention_scheme_is_registered(self):
+        scheme_cls = get_scheme_class("FAKQuant", "attention")
+
+        self.assertIsNotNone(scheme_cls)
+        self.assertEqual(scheme_cls.__name__, "AscendFAQuantAttentionMethod")
+
+    def test_get_quant_method_for_c8_kv_cache_attention(self):
+        config = AscendModelSlimConfig({
+            "weight": "INT8",
+            "kv_cache_type": "C8",
+        })
+        attention_layer = MagicMock(spec=Attention)
+        mock_config = MagicMock()
+        mock_config.model_config.hf_config.model_type = None
+        mock_config.kv_transfer_config = None
+        mock_method = MagicMock()
+
+        with patch("vllm_ascend.quantization.modelslim_config.get_current_vllm_config", return_value=mock_config), \
+            patch("vllm_ascend.quantization.methods.kv_c8.get_current_vllm_config", return_value=mock_config), \
+            patch(
+                "vllm_ascend.quantization.method_adapters.AscendKVCacheMethod", return_value=mock_method
+            ) as mock_kvcache:
+            method = config.get_quant_method(attention_layer, "model.layers.0.self_attn.attn")
+
+        self.assertTrue(config.enable_c8_quant)
+        self.assertIs(method, mock_method)
+        self.assertEqual(mock_kvcache.call_args.args[0].__class__.__name__, "AscendC8KVCacheAttentionMethod")
 
     def test_get_quant_method_for_fused_moe(self):
         fused_moe_layer = MagicMock(spec=FusedMoE)

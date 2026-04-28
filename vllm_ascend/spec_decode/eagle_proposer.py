@@ -377,12 +377,9 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             self.update_stream = torch.npu.Stream()
-            if self.method == "mtp":
-                self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
-            else:
-                self._runnable = ACLGraphWrapper(
-                    self._run_merged_draft, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
-                )
+            self._runnable = ACLGraphWrapper(
+                self._run_merged_draft, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+            )
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
