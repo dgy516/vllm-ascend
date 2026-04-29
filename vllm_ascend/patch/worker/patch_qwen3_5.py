@@ -20,7 +20,10 @@
 import torch
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
+from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from vllm.model_executor.models.qwen3_5 import Qwen3_5GatedDeltaNet
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
@@ -30,7 +33,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.ops.triton.fla.sigmoid_gating import fused_sigmoid_gating_delta_rule_update
 from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
-from vllm_ascend.utils import enable_sp, vllm_version_is
+from vllm_ascend.utils import enable_custom_op, enable_sp, vllm_version_is
 
 
 def to_int64_tuple(t):
@@ -38,6 +41,46 @@ def to_int64_tuple(t):
     if t.dim() == 0:
         return (t.item(),)
     return tuple(t.tolist())
+
+
+def _causal_conv1d_prefill(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+):
+    if enable_custom_op():
+        conv_weights_t = conv_weights.transpose(0, 1)
+        activation_num = 1 if activation else 0
+        return torch.ops._C_ascend.npu_causal_conv1d_custom(
+            x,
+            conv_weights_t,
+            conv_state=conv_state.transpose(-1, -2),
+            bias_opt=bias,
+            query_start_loc_opt=to_int64_tuple(query_start_loc),
+            cache_indices_opt=to_int64_tuple(cache_indices),
+            initial_state_mode_opt=to_int64_tuple(has_initial_state),
+            num_accepted_tokens_opt=[],
+            activation_mode=activation_num,
+            pad_slot_id=PAD_SLOT_ID,
+            run_mode=0,
+        )
+
+    return causal_conv1d_fn(
+        x.transpose(0, 1),
+        conv_weights,
+        bias=bias,
+        activation=activation,
+        conv_states=conv_state,
+        has_initial_state=has_initial_state,
+        cache_indices=cache_indices,
+        query_start_loc=query_start_loc,
+        pad_slot_id=PAD_SLOT_ID,
+    ).transpose(0, 1)
 
 
 class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
@@ -116,20 +159,15 @@ class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             if mixed_qkv_non_spec is not None:
-                conv_weights_T = conv_weights.transpose(0, 1)
-                activation_num = 1 if self.activation else 0
-                mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
+                mixed_qkv_non_spec = _causal_conv1d_prefill(
                     mixed_qkv_non_spec,
-                    conv_weights_T,
-                    conv_state=self_kv_cache[0],
-                    bias_opt=self.conv1d.bias,
-                    query_start_loc_opt=to_int64_tuple(non_spec_query_start_loc),
-                    cache_indices_opt=to_int64_tuple(non_spec_state_indices_tensor),
-                    initial_state_mode_opt=to_int64_tuple(has_initial_state),
-                    num_accepted_tokens_opt=[],
-                    activation_mode=activation_num,
-                    pad_slot_id=PAD_SLOT_ID,
-                    run_mode=0,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    non_spec_query_start_loc,
+                    non_spec_state_indices_tensor,
+                    has_initial_state,
                 )
         elif attn_metadata.num_decodes > 0:
             mixed_qkv_non_spec = causal_conv1d_update(

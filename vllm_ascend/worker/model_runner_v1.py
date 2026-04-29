@@ -2424,7 +2424,9 @@ class NPUModelRunner(GPUModelRunner):
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
-            if self.is_multimodal_model and not self.model_config.is_encoder_decoder or self.enable_prompt_embeds:
+            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
+                input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
+            elif self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
             else:

@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 # isort: on
 
 DONE_SENDING_MSG = b"done_sending_msg"
+MOONCAKE_BUFFER_ALIGNMENT = 2 * 1024 * 1024
 
 
 @dataclass
@@ -274,6 +275,19 @@ class KVCacheSendingLayerThread(threading.Thread):
 
         if isinstance(layer_kv_cache_spec, MambaSpec):
             # only support one block transfer for mamba
+            if len(local_block_ids) == 0 or len(remote_block_ids) == 0:
+                return (src_list, dst_list, length_list)
+            state_block_offset = 0
+            if getattr(layer_kv_cache_spec, "mamba_cache_mode", None) == "align":
+                state_token_len = max(req_meta.local_computed_tokens, req_meta.prompt_len)
+                state_block_offset = max(state_token_len - 1, 0) // self.block_size[layer_group_idx]
+                state_block_offset = min(
+                    state_block_offset,
+                    len(local_block_ids) - 1,
+                    len(remote_block_ids) - 1,
+                )
+            local_state_block_id = local_block_ids[state_block_offset]
+            remote_state_block_id = remote_block_ids[state_block_offset]
             local_conv_addr, local_ssm_addr = local_layer_metadata.kv_caches_base_addr
             remote_conv_addr, remote_ssm_addr = remote_layer_metadata.kv_caches_base_addr
             local_conv_len, local_ssm_len = local_layer_metadata.block_len
@@ -281,14 +295,14 @@ class KVCacheSendingLayerThread(threading.Thread):
             if tp_ratio == 1:
                 src_list.extend(
                     [
-                        local_conv_addr + local_block_ids[0] * local_conv_len,
-                        local_ssm_addr + local_block_ids[0] * local_ssm_len,
+                        local_conv_addr + local_state_block_id * local_conv_len,
+                        local_ssm_addr + local_state_block_id * local_ssm_len,
                     ]
                 )
                 dst_list.extend(
                     [
-                        remote_conv_addr + remote_block_ids[0] * local_conv_len,
-                        remote_ssm_addr + remote_block_ids[0] * local_ssm_len,
+                        remote_conv_addr + remote_state_block_id * local_conv_len,
+                        remote_ssm_addr + remote_state_block_id * local_ssm_len,
                     ]
                 )
                 length_list.extend([local_conv_len, local_ssm_len])
@@ -320,13 +334,25 @@ class KVCacheSendingLayerThread(threading.Thread):
                             (i * conv_shape[1] + local_conv_offset) * tp_ratio
                             + (self.tp_rank % tp_ratio) * local_conv_size
                         ) * get_dtype_size(conv_dtype)
-                        src_list.append(local_conv_addr + local_block_ids[0] * local_conv_len + local_addr_offset)
-                        dst_list.append(remote_conv_addr + remote_block_ids[0] * remote_conv_len + remote_addr_offset)
+                        src_list.append(
+                            local_conv_addr
+                            + local_state_block_id * local_conv_len
+                            + local_addr_offset
+                        )
+                        dst_list.append(
+                            remote_conv_addr
+                            + remote_state_block_id * remote_conv_len
+                            + remote_addr_offset
+                        )
                         length_list.append(local_conv_size * get_dtype_size(conv_dtype))
                 # ssm
                 remote_addr_offset = (self.tp_rank % tp_ratio) * math.prod(ssm_shape) * get_dtype_size(ssm_dtype)
-                src_list.append(local_ssm_addr + local_block_ids[0] * local_ssm_len)
-                dst_list.append(remote_ssm_addr + remote_block_ids[0] * remote_ssm_len + remote_addr_offset)
+                src_list.append(local_ssm_addr + local_state_block_id * local_ssm_len)
+                dst_list.append(
+                    remote_ssm_addr
+                    + remote_state_block_id * remote_ssm_len
+                    + remote_addr_offset
+                )
                 length_list.append(local_ssm_len)
         else:
             if self.pd_head_ratio == 1:
@@ -871,16 +897,28 @@ class MooncakeLayerwiseConnectorScheduler:
             for req_id, scheduled_tokens in scheduler_output.num_scheduled_tokens.items():
                 if req_id in self._reqs_need_send_layerwise:
                     send_req_info = self._reqs_need_send_layerwise[req_id]
+                    prompt_len = send_req_info.request.num_prompt_tokens
                     # update local transferred tokens
                     send_req_info.update_transferred_tokens(
-                        round_down(send_req_info.local_computed_tokens, min(self.block_size))
+                        min(
+                            round_down(
+                                send_req_info.local_computed_tokens,
+                                min(self.block_size),
+                            ),
+                            prompt_len,
+                        )
                     )
                     # update local computed tokens, not transfer spec decode tokens
                     spec_decode_tokens = (
                         len(scheduled_spec_decode_tokens[req_id]) if (req_id in scheduled_spec_decode_tokens) else 0
                     )
                     send_req_info.update_computed_tokens(
-                        computed_tokens.get(req_id, 0) + scheduled_tokens - spec_decode_tokens
+                        min(
+                            computed_tokens.get(req_id, 0)
+                            + scheduled_tokens
+                            - spec_decode_tokens,
+                            prompt_len,
+                        )
                     )
 
                     def add_transfer_task(req_id, send_req_info: SendReqInfo, chunk_finish=False):
@@ -897,13 +935,16 @@ class MooncakeLayerwiseConnectorScheduler:
                             token_ids=[],
                             chunk_finish=chunk_finish,
                             remote_cache_tokens=request.kv_transfer_params.get("remote_cached_tokens"),
-                            prompt_len=len(request.all_token_ids),
-                            local_computed_tokens=local_computed_tokens,
+                            prompt_len=request.num_prompt_tokens,
+                            local_computed_tokens=min(
+                                local_computed_tokens,
+                                request.num_prompt_tokens,
+                            ),
                             local_transed_tokens=local_transed_tokens,
                         )
                         logger.debug(
                             f"MooncakeLayerwiseConnector build_connector_meta: {req_id=}"
-                            f"prompt_len={len(request.all_token_ids)} {local_computed_tokens=}"
+                            f"prompt_len={request.num_prompt_tokens} {local_computed_tokens=}"
                             f"{local_transed_tokens=}"
                             f"remote_cache_tokens={request.kv_transfer_params.get('remote_cached_tokens')}"
                             f"{chunk_finish=} {local_block_ids=}"
@@ -911,7 +952,10 @@ class MooncakeLayerwiseConnectorScheduler:
                         )
 
                     # whether chunk finish
-                    chunk_finish = send_req_info.local_computed_tokens >= len(send_req_info.request.all_token_ids)
+                    chunk_finish = (
+                        send_req_info.local_computed_tokens
+                        >= send_req_info.request.num_prompt_tokens
+                    )
 
                     add_transfer_task(req_id, send_req_info, chunk_finish=chunk_finish)
                     if chunk_finish:
@@ -1096,16 +1140,11 @@ class MooncakeLayerwiseConnectorWorker:
                 layer2group_ids[layer_name] = i
 
         use_mamba, use_attn, use_attn_mamba_hybrid = False, False, False
-        conv_total_padding_size = 0
         for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
             for layer_name in kv_cache_tensor.shared_by:
                 layer_kv_cache_spec = self.kv_cache_specs[layer2group_ids[layer_name]]
                 if isinstance(layer_kv_cache_spec, MambaSpec):
                     use_mamba = True
-                    conv_shape, conv_dtype = layer_kv_cache_spec.shapes[0], layer_kv_cache_spec.dtypes[0]
-                    conv_total_padding_size = (
-                        self.kv_cache_config.num_blocks * math.prod(conv_shape) * get_dtype_size(conv_dtype)
-                    )
                 if isinstance(layer_kv_cache_spec, AttentionSpec):
                     use_attn = True
             if use_mamba and use_attn:
@@ -1114,6 +1153,7 @@ class MooncakeLayerwiseConnectorWorker:
 
         ptrs = []
         lengths = []
+        cache_ranges: dict[str, list[tuple[int, int]]] = {}
         use_kv_buffer = False
         kv_buffer = None
         for layer_name, kv_cache_tuple in kv_caches.items():
@@ -1151,18 +1191,33 @@ class MooncakeLayerwiseConnectorWorker:
                         num_blocks * single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale
                     )
                 logger.info(f"layer: {layer_name}, num_blocks: {num_blocks}, block_shape: {block_shape}")
+                if use_attn_mamba_hybrid:
+                    cache_ranges.setdefault(layer_name, []).append(
+                        (
+                            single_kv_cache.data_ptr(),
+                            single_kv_cache.numel() * single_kv_cache.element_size(),
+                        )
+                    )
             self.layer_metadata[layer_name] = single_layer_meta
 
         if use_attn_mamba_hybrid:
             for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
-                tensor_addrs = []
+                tensor_ranges = []
                 for layer_name in kv_cache_tensor.shared_by:
-                    tensor_addrs.extend(self.layer_metadata[layer_name].kv_caches_base_addr)
-                    if "mtp" in layer_name:
-                        tensor_addrs.append(min(tensor_addrs) - conv_total_padding_size)
-                assert min(set(tensor_addrs)) % (2 * 1024 * 1024) == 0, "Tensor start addr is not align with 2M."
-                ptrs.append(min(set(tensor_addrs)))
-                lengths.append(kv_cache_tensor.size)
+                    tensor_ranges.extend(cache_ranges[layer_name])
+                start_addr = min(addr for addr, _ in tensor_ranges)
+                end_addr = max(addr + size for addr, size in tensor_ranges)
+                if start_addr % MOONCAKE_BUFFER_ALIGNMENT != 0:
+                    # In hybrid KV layouts, attention views can start after
+                    # leading padding inside an aligned raw tensor. Register the
+                    # aligned range that covers the actual cache views instead
+                    # of deriving the raw start from a model-wide conv size.
+                    start_addr = round_down(start_addr, MOONCAKE_BUFFER_ALIGNMENT)
+                assert start_addr % MOONCAKE_BUFFER_ALIGNMENT == 0, (
+                    "Tensor start addr is not align with 2M."
+                )
+                ptrs.append(start_addr)
+                lengths.append(end_addr - start_addr)
 
         global_te.register_buffer(ptrs, lengths)
         if use_kv_buffer:

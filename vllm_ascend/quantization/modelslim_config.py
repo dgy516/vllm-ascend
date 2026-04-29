@@ -533,6 +533,12 @@ class AscendModelSlimConfig(QuantizationConfig):
             "k_proj.kv_cache_offset": "attn.k_cache_offset",
             "v_proj.kv_cache_scale": "attn.v_cache_scale",
             "v_proj.kv_cache_offset": "attn.v_cache_offset",
+            # Qwen3.5 remaps HF k_proj/v_proj C8 tensors through its packed
+            # qkv loader before Qwen3_5Model.load_weights sees them.
+            "qkqkv_proj.kv_cache_scale": "attn.k_cache_scale",
+            "qkqkv_proj.kv_cache_offset": "attn.k_cache_offset",
+            "qkv_proj.kv_cache_scale": "attn.v_cache_scale",
+            "qkv_proj.kv_cache_offset": "attn.v_cache_offset",
         }
         for src_suffix, dst_suffix in _C8_SCALE_MAPPING.items():
             if name.endswith(src_suffix):

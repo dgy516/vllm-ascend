@@ -278,15 +278,52 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         block_table = common_attn_metadata.block_table_tensor
         seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        seq_lens_list = seq_lens.tolist()
+        actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
+
+        if (
+            self.speculative_config is not None
+            and num_prefills == 0
+            and num_decode_tokens > num_decodes
+        ):
+            query_lens = query_start_loc_cpu[1 : num_reqs + 1] - query_start_loc_cpu[:num_reqs]
+            computed_lens = common_attn_metadata.num_computed_tokens_cpu[:num_reqs]
+
+            flattened_seq_lens: list[int] = []
+            repeat_counts: list[int] = []
+            for computed_len, query_len in zip(computed_lens.tolist(), query_lens.tolist()):
+                query_len = int(query_len)
+                repeat_counts.append(query_len)
+                flattened_seq_lens.extend(
+                    int(computed_len) + step for step in range(1, query_len + 1)
+                )
+
+            if flattened_seq_lens:
+                # FIA TND treats each decode query token as a separate q batch.
+                # For MTP target verification, each token must see only the KV
+                # prefix up to its own position, so KV lengths are expanded per token.
+                seq_lens = torch.tensor(flattened_seq_lens, dtype=seq_lens.dtype)
+                seq_lens_list = flattened_seq_lens
+                actual_seq_lengths_q = list(range(1, len(flattened_seq_lens) + 1))
+                num_decodes = len(flattened_seq_lens)
+                num_decode_tokens = len(flattened_seq_lens)
+                repeat_counts_tensor = torch.tensor(
+                    repeat_counts, dtype=torch.long, device=block_table.device
+                )
+                block_table = torch.repeat_interleave(
+                    block_table[:num_reqs], repeat_counts_tensor, dim=0
+                )
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
         # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
         if isinstance(self.kv_cache_spec, CrossAttentionSpec):
             seq_lens = common_attn_metadata.seq_lens
+            seq_lens_list = seq_lens.tolist()
             slot_mapping = common_attn_metadata.slot_mapping.to(torch.int32)
         elif self.speculative_config and self.speculative_config.parallel_drafting:
             seq_lens = common_attn_metadata.seq_lens
+            seq_lens_list = seq_lens.tolist()
 
         attn_state = common_attn_metadata.attn_state
 
@@ -309,15 +346,16 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             block_tables=block_table,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
-            seq_lens_list=seq_lens.tolist(),
+            seq_lens_list=seq_lens_list,
             max_query_len=common_attn_metadata.max_query_len,
-            actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
+            actual_seq_lengths_q=actual_seq_lengths_q,
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
             swa_mask=swa_mask,
             attn_state=attn_state,
             num_prefills=num_prefills,
             num_decodes=num_decodes,
+            num_decodes_flatten=num_decode_tokens,
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
         )
