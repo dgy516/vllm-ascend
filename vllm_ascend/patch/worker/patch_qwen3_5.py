@@ -350,6 +350,11 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
             q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
+        forward_context = get_forward_context()
+        kv_cache_layer = self.attn.kv_cache[forward_context.virtual_engine]
+        if not isinstance(kv_cache_layer, (list, tuple)):
+            kv_cache_layer = [kv_cache_layer]
+        maybe_save_kv_layer_to_connector(self.attn.layer_name, list(kv_cache_layer))
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)

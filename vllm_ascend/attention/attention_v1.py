@@ -575,12 +575,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
             attn_count = 0
 
-            def get_current_attn_metadata(layer_name):
+            def get_current_attn_metadata(layer_name, advance_draft_step=True):
                 nonlocal attn_count
                 if _EXTRA_CTX.is_draft_model:
-                    draft_step = attn_count // num_layers
+                    metadata_count = attn_count if advance_draft_step else max(attn_count - 1, 0)
+                    draft_step = metadata_count // num_layers
                     metadata = attn_metadata[draft_step][layer_name]
-                    attn_count = attn_count + 1
+                    if advance_draft_step:
+                        attn_count = attn_count + 1
                     return metadata
                 return attn_metadata[layer_name]
 
@@ -610,7 +612,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             attn_output,
                             softmax_lse,
                         ) = param
-                        metadata = get_current_attn_metadata(layer_name)
+                        # A single C8 attention layer can be split into
+                        # multiple FIA graph tasks. Those chunks still belong
+                        # to the same layer and must share the same MTP draft
+                        # step metadata; only the first chunk advances to the
+                        # next layer/step.
+                        metadata = get_current_attn_metadata(
+                            layer_name,
+                            advance_draft_step=chunk_start == 0,
+                        )
                         seq_lens = metadata.seq_lens_list[chunk_start:chunk_end]
                         block_tables = metadata.block_tables[chunk_start:chunk_end]
 

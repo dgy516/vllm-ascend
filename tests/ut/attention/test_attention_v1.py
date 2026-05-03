@@ -367,6 +367,99 @@ class TestAscendAttentionBackendImpl(TestBase):
         assert kwargs["key_antiquant_mode"] == 0
         assert kwargs["value_antiquant_mode"] == 0
 
+    @patch('vllm_ascend.attention.attention_v1.using_paged_attention',
+           return_value=False)
+    @patch('vllm_ascend.attention.attention_v1.get_draft_graph_params')
+    @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
+    @patch('torch_npu.npu_fused_infer_attention_score')
+    @patch('torch.npu.graph_task_update_end')
+    @patch('torch.npu.graph_task_update_begin')
+    @patch('torch.npu.stream', return_value=nullcontext())
+    def test_update_graph_params_keeps_c8_chunks_on_same_draft_step(
+        self,
+        _mock_stream,
+        _mock_update_begin,
+        _mock_update_end,
+        mock_fia,
+        mock_extra_ctx,
+        mock_get_draft_graph_params,
+        _mock_using_paged_attention,
+    ):
+
+        def make_metadata(base):
+            metadata = MagicMock()
+            metadata.seq_lens_list = [base + i for i in range(4)]
+            metadata.block_tables = torch.arange(base, base + 16).view(4, 4)
+            return metadata
+
+        draft_attn_metadatas = [
+            {
+                "layer.0.self_attn": make_metadata(10),
+                "layer.1.self_attn": make_metadata(20),
+            },
+            {
+                "layer.0.self_attn": make_metadata(110),
+                "layer.1.self_attn": make_metadata(120),
+            },
+        ]
+
+        def make_c8_param(layer_name, chunk_start, chunk_end):
+            return (
+                C8_DECODE_GRAPH_PARAM_TAG,
+                layer_name,
+                chunk_start,
+                chunk_end,
+                torch.empty(chunk_end - chunk_start, 8, 1, 64),
+                torch.empty(8, 128, 512, dtype=torch.int8),
+                torch.empty(8, 128, 512, dtype=torch.int8),
+                torch.empty(1, 8, 1, 64),
+                torch.empty(1, 8, 1, 64),
+                torch.empty(1, 8, 1, 64),
+                torch.empty(1, 8, 1, 64),
+                128,
+                8,
+                8,
+                1.0,
+                torch.empty(chunk_end - chunk_start, 8, 1, 64),
+                torch.empty(1),
+            )
+
+        c8_params = [
+            make_c8_param("layer.0.self_attn", 0, 2),
+            make_c8_param("layer.0.self_attn", 2, 4),
+            make_c8_param("layer.1.self_attn", 0, 2),
+            make_c8_param("layer.1.self_attn", 2, 4),
+            make_c8_param("layer.0.self_attn", 0, 2),
+            make_c8_param("layer.0.self_attn", 2, 4),
+        ]
+        graph_params = MagicMock()
+        graph_params.attn_params = {4: c8_params}
+        graph_params.handles = {4: [MagicMock() for _ in c8_params]}
+        graph_params.events = {4: [MagicMock() for _ in c8_params]}
+        mock_get_draft_graph_params.return_value = graph_params
+        mock_extra_ctx.is_draft_model = True
+
+        AscendAttentionBackendImpl.update_graph_params(
+            update_stream=MagicMock(),
+            forward_context=MagicMock(),
+            num_tokens=4,
+            vllm_config=MagicMock(),
+            draft_attn_metadatas=draft_attn_metadatas,
+        )
+
+        actual_seq_lens = [
+            call.kwargs["actual_seq_lengths_kv"]
+            for call in mock_fia.out.call_args_list
+        ]
+        assert actual_seq_lens == [
+            [10, 11],
+            [12, 13],
+            [20, 21],
+            [22, 23],
+            [110, 111],
+            [112, 113],
+        ]
+
     @patch('torch_npu._npu_reshape_and_cache')
     @patch('torch_npu.npu_fused_infer_attention_score')
     @patch('vllm_ascend.ascend_forward_context.get_forward_context')
@@ -464,7 +557,6 @@ class TestAscendAttentionBackendImpl(TestBase):
                                                                     64), 1)
         output = self.impl_swa.forward(layer, query, key, value, kv_cache,
                                        metadata, output)
-        print(output.shape)
         mock_fused_infer_attention_score.assert_called_once()
         assert output.shape == (10, 8, 64)
 

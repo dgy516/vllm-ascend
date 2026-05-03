@@ -246,6 +246,13 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_event = ready_event
         self.callback_func = callback_func
 
+    @staticmethod
+    def _wait_event_complete(event: torch.npu.Event) -> None:
+        # Event.synchronize() can hang in this path on current ADXL/CANN
+        # stacks. A device-wide sync is more conservative, but keeps the
+        # layerwise KV transfer ordering correct.
+        torch.npu.synchronize()
+
     def run(self):
         local_rank = get_world_group().local_rank
         device = torch.device(f"npu:{local_rank}")
@@ -473,7 +480,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             You can manually build the master branch of the project at https://gitcode.com/cann/hixl
             to resolve this issue before the 8.5.RC1 release.
             """
-            send_task.wait_event.synchronize()  # type:ignore
+            self._wait_event_complete(send_task.wait_event)  # type: ignore[arg-type]
         elif self.pd_head_ratio > 1:
             self.resharding_stream.synchronize()
 
@@ -752,10 +759,16 @@ class MooncakeLayerwiseConnectorScheduler:
         self.ca_path = ssl_ca_certs
         if self.ssl_enable:
             self.metaserver_client = httpx.Client(
-                limits=httpx.Limits(max_connections=100000), timeout=None, cert=self.cert_path, verify=self.ca_path
+                limits=httpx.Limits(max_connections=100000),
+                timeout=None,
+                cert=self.cert_path,
+                verify=self.ca_path,
+                trust_env=False,
             )
         else:
-            self.metaserver_client = httpx.Client(limits=httpx.Limits(max_connections=100000), timeout=None)
+            self.metaserver_client = httpx.Client(
+                limits=httpx.Limits(max_connections=100000), timeout=None, trust_env=False
+            )
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         """

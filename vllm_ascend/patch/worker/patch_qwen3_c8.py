@@ -18,21 +18,112 @@
 from collections.abc import Iterable
 
 import torch
+from torch import nn
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
 from vllm.model_executor.models.qwen3_5 import (
+    Qwen3_5ForCausalLM,
     Qwen3_5ForCausalLMBase,
     Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
 )
 from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+from vllm.model_executor.models.utils import maybe_prefix
 
+_orig_qwen3_5_conditional_generation_init = (
+    Qwen3_5ForConditionalGeneration.__init__
+)
+_orig_qwen3_5_moe_conditional_generation_init = (
+    Qwen3_5MoeForConditionalGeneration.__init__
+)
 _orig_qwen3_causal_lm_load_weights = Qwen3ForCausalLM.load_weights
 _orig_qwen3_5_causal_lm_base_load_weights = Qwen3_5ForCausalLMBase.load_weights
 _orig_qwen3_5_conditional_generation_load_weights = (
     Qwen3_5ForConditionalGeneration.load_weights
 )
+_orig_qwen3_5_moe_conditional_generation_load_weights = (
+    Qwen3_5MoeForConditionalGeneration.load_weights
+)
 _orig_qwen3_5_mtp_load_weights = Qwen3_5MTP.load_weights
+
+
+def _is_language_model_only(vllm_config) -> bool:
+    multimodal_config = getattr(vllm_config.model_config, "multimodal_config", None)
+    return bool(getattr(multimodal_config, "language_model_only", False))
+
+
+def _init_qwen3_5_text_only_conditional_generation(
+    self,
+    *,
+    vllm_config,
+    prefix: str,
+    causal_lm_cls,
+) -> None:
+    nn.Module.__init__(self)
+    config = vllm_config.model_config.hf_config
+    multimodal_config = vllm_config.model_config.multimodal_config
+
+    self.config = config
+    self.multimodal_config = multimodal_config
+    self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+    self.is_multimodal_pruning_enabled = False
+
+    with self._mark_language_model(vllm_config):
+        self.language_model = causal_lm_cls(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "language_model"),
+        )
+
+    self.make_empty_intermediate_tensors = (
+        self.language_model.make_empty_intermediate_tensors
+    )
+
+
+def _patched_qwen3_5_conditional_generation_init(
+    self,
+    *,
+    vllm_config,
+    prefix: str = "model",
+) -> None:
+    if not _is_language_model_only(vllm_config):
+        _orig_qwen3_5_conditional_generation_init(
+            self,
+            vllm_config=vllm_config,
+            prefix=prefix,
+        )
+        return
+
+    _init_qwen3_5_text_only_conditional_generation(
+        self,
+        vllm_config=vllm_config,
+        prefix=prefix,
+        causal_lm_cls=Qwen3_5ForCausalLM,
+    )
+
+
+def _patched_qwen3_5_moe_conditional_generation_init(
+    self,
+    *,
+    vllm_config,
+    prefix: str = "model",
+) -> None:
+    if not _is_language_model_only(vllm_config):
+        _orig_qwen3_5_moe_conditional_generation_init(
+            self,
+            vllm_config=vllm_config,
+            prefix=prefix,
+        )
+        return
+
+    _init_qwen3_5_text_only_conditional_generation(
+        self,
+        vllm_config=vllm_config,
+        prefix=prefix,
+        causal_lm_cls=Qwen3_5MoeForCausalLM,
+    )
+    self.set_moe_parameters()
 
 
 def _get_quant_config(module):
@@ -72,6 +163,11 @@ def _load_weights_with_c8_scale_intercept(
     params_dict = dict(self.named_parameters())
     c8_loaded_params: set[str] = set()
 
+    def _is_uninstantiated_visual_weight(name: str) -> bool:
+        if hasattr(self, "visual"):
+            return False
+        return name.startswith(("visual.", "model.visual.", "thinker.visual."))
+
     def _candidate_names(name: str) -> Iterable[str]:
         mapped_name = mapper._map_name(name) if mapper is not None else None
         names = [
@@ -105,6 +201,8 @@ def _load_weights_with_c8_scale_intercept(
         raw_weights: Iterable[tuple[str, torch.Tensor]],
     ) -> Iterable[tuple[str, torch.Tensor]]:
         for name, loaded_weight in raw_weights:
+            if _is_uninstantiated_visual_weight(name):
+                continue
             c8_scale_seen = False
             loaded = False
             for candidate_name in _candidate_names(name):
@@ -164,6 +262,17 @@ def _patched_qwen3_5_conditional_generation_load_weights(
     )
 
 
+def _patched_qwen3_5_moe_conditional_generation_load_weights(
+    self, weights: Iterable[tuple[str, torch.Tensor]]
+) -> set[str]:
+    return _load_weights_with_c8_scale_intercept(
+        self,
+        weights,
+        _orig_qwen3_5_moe_conditional_generation_load_weights,
+        mapper=self.hf_to_vllm_mapper,
+    )
+
+
 def _patched_qwen3_5_mtp_load_weights(
     self,
     weights: Iterable[tuple[str, torch.Tensor]],
@@ -171,7 +280,10 @@ def _patched_qwen3_5_mtp_load_weights(
     return _load_weights_with_c8_scale_intercept(self, weights, _orig_qwen3_5_mtp_load_weights)
 
 
+Qwen3_5ForConditionalGeneration.__init__ = _patched_qwen3_5_conditional_generation_init
+Qwen3_5MoeForConditionalGeneration.__init__ = _patched_qwen3_5_moe_conditional_generation_init
 Qwen3ForCausalLM.load_weights = _patched_qwen3_causal_lm_load_weights
 Qwen3_5ForCausalLMBase.load_weights = _patched_qwen3_5_causal_lm_base_load_weights
 Qwen3_5ForConditionalGeneration.load_weights = _patched_qwen3_5_conditional_generation_load_weights
+Qwen3_5MoeForConditionalGeneration.load_weights = _patched_qwen3_5_moe_conditional_generation_load_weights
 Qwen3_5MTP.load_weights = _patched_qwen3_5_mtp_load_weights
