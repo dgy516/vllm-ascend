@@ -245,18 +245,20 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.v_quant_buffer = v_quant_buffer
         self.ready_event = ready_event
         self.callback_func = callback_func
+        self.event_wait_stream: torch.npu.Stream | None = None
 
-    @staticmethod
-    def _wait_event_complete(event: torch.npu.Event) -> None:
-        # Event.synchronize() can hang in this path on current ADXL/CANN
-        # stacks. A device-wide sync is more conservative, but keeps the
-        # layerwise KV transfer ordering correct.
-        torch.npu.synchronize()
+    def _wait_event_complete(self, event: torch.npu.Event | None) -> None:
+        assert event is not None, "KV transfer must wait for the cache update event."
+        if self.event_wait_stream is None:
+            self.event_wait_stream = torch.npu.Stream()
+        self.event_wait_stream.wait_event(event)
+        self.event_wait_stream.synchronize()
 
     def run(self):
         local_rank = get_world_group().local_rank
         device = torch.device(f"npu:{local_rank}")
         torch.npu.set_device(device)
+        self.event_wait_stream = torch.npu.Stream()
         self.ready_event.set()
         while True:
             send_task = self.send_queue.get()
@@ -480,7 +482,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             You can manually build the master branch of the project at https://gitcode.com/cann/hixl
             to resolve this issue before the 8.5.RC1 release.
             """
-            self._wait_event_complete(send_task.wait_event)  # type: ignore[arg-type]
+            self._wait_event_complete(send_task.wait_event)
         elif self.pd_head_ratio > 1:
             self.resharding_stream.synchronize()
 
