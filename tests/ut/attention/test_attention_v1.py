@@ -1,12 +1,15 @@
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend.attention.attention_v1 import (AscendAttentionBackend,
+                                                AscendC8AttentionBackendImpl,
                                                 AscendAttentionBackendImpl,
                                                 AscendAttentionMetadataBuilder,
-                                                AscendAttentionState)
+                                                AscendAttentionState,
+                                                C8_DECODE_GRAPH_PARAM_TAG)
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.utils import AscendDeviceType
 
@@ -209,6 +212,160 @@ class TestAscendAttentionBackendImpl(TestBase):
                                    output)
 
         assert output.shape == (10, 8 * 64)
+
+    def test_mtp_decode_metadata_flattens_before_forward(self):
+        block_tables = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        seq_lens = torch.tensor([12, 20], dtype=torch.int32)
+        seq_lens_list = [12, 20]
+        query_lens = torch.tensor([4, 4], dtype=torch.int32)
+        computed_lens = torch.tensor([8, 16], dtype=torch.int32)
+
+        (
+            expanded_blocks,
+            expanded_seq_lens,
+            expanded_seq_lens_list,
+            actual_seq_lengths_q,
+            num_decodes,
+            num_decode_tokens,
+        ) = AscendAttentionMetadataBuilder._flatten_mtp_decode_metadata(
+                block_tables,
+                seq_lens,
+                seq_lens_list,
+                query_lens,
+                computed_lens,
+                num_reqs=2,
+                num_decodes=2,
+                num_prefills=0,
+                num_decode_tokens=8,
+            )
+
+        assert expanded_seq_lens.tolist() == [9, 10, 11, 12, 17, 18, 19, 20]
+        assert expanded_seq_lens_list == [9, 10, 11, 12, 17, 18, 19, 20]
+        assert actual_seq_lengths_q == [1, 2, 3, 4, 5, 6, 7, 8]
+        assert num_decodes == 8
+        assert num_decode_tokens == 8
+        assert expanded_blocks.tolist() == [
+            [1, 2, 3],
+            [1, 2, 3],
+            [1, 2, 3],
+            [1, 2, 3],
+            [4, 5, 6],
+            [4, 5, 6],
+            [4, 5, 6],
+            [4, 5, 6],
+        ]
+
+    def test_mtp_chunked_prefill_metadata_keeps_prefill_rows(self):
+        block_tables = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        seq_lens = torch.tensor([12, 20, 6], dtype=torch.int32)
+        query_lens = torch.tensor([4, 4, 6], dtype=torch.int32)
+        computed_lens = torch.tensor([8, 16, 0], dtype=torch.int32)
+
+        (
+            expanded_blocks,
+            expanded_seq_lens,
+            expanded_seq_lens_list,
+            actual_seq_lengths_q,
+            num_decodes,
+            num_decode_tokens,
+        ) = AscendAttentionMetadataBuilder._flatten_mtp_decode_metadata(
+            block_tables,
+            seq_lens,
+            seq_lens.tolist(),
+            query_lens,
+            computed_lens,
+            num_reqs=3,
+            num_decodes=2,
+            num_prefills=1,
+            num_decode_tokens=8,
+        )
+
+        assert expanded_seq_lens.tolist() == [9, 10, 11, 12, 17, 18, 19, 20, 6]
+        assert expanded_seq_lens_list == [9, 10, 11, 12, 17, 18, 19, 20, 6]
+        assert actual_seq_lengths_q == [1, 2, 3, 4, 5, 6, 7, 8, 14]
+        assert num_decodes == 8
+        assert num_decode_tokens == 8
+        assert expanded_blocks.tolist() == [
+            [1, 2, 3],
+            [1, 2, 3],
+            [1, 2, 3],
+            [1, 2, 3],
+            [4, 5, 6],
+            [4, 5, 6],
+            [4, 5, 6],
+            [4, 5, 6],
+            [7, 8, 9],
+        ]
+
+    @patch('vllm_ascend.attention.attention_v1.using_paged_attention',
+           return_value=False)
+    @patch('vllm_ascend.attention.attention_v1.get_graph_params')
+    @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
+    @patch('torch_npu.npu_fused_infer_attention_score')
+    @patch('torch.npu.graph_task_update_end')
+    @patch('torch.npu.graph_task_update_begin')
+    @patch('torch.npu.stream', return_value=nullcontext())
+    def test_update_graph_params_refreshes_c8_decode_metadata(
+        self,
+        _mock_stream,
+        mock_update_begin,
+        mock_update_end,
+        mock_fia,
+        mock_extra_ctx,
+        mock_get_graph_params,
+        _mock_using_paged_attention,
+    ):
+        metadata = MagicMock()
+        metadata.seq_lens_list = [9, 10, 11, 12] * 4
+        metadata.actual_seq_lengths_q = list(range(1, 17))
+        metadata.block_tables = torch.arange(64).view(16, 4)
+
+        graph_params = MagicMock()
+        graph_params.attn_params = {
+            16: [(
+                C8_DECODE_GRAPH_PARAM_TAG,
+                "layer.0.self_attn",
+                0,
+                16,
+                torch.empty(16, 8, 1, 64),
+                torch.empty(8, 128, 512, dtype=torch.int8),
+                torch.empty(8, 128, 512, dtype=torch.int8),
+                torch.empty(1, 8, 1, 64),
+                torch.empty(1, 8, 1, 64),
+                torch.empty(1, 8, 1, 64),
+                torch.empty(1, 8, 1, 64),
+                128,
+                8,
+                8,
+                1.0,
+                torch.empty(16, 8, 1, 64),
+                torch.empty(1),
+            )]
+        }
+        graph_params.handles = {16: [MagicMock()]}
+        graph_params.events = {16: [MagicMock()]}
+        mock_get_graph_params.return_value = graph_params
+        mock_extra_ctx.is_draft_model = False
+
+        forward_context = MagicMock()
+        forward_context.attn_metadata = {"layer.0.self_attn": metadata}
+
+        AscendAttentionBackendImpl.update_graph_params(
+            update_stream=MagicMock(),
+            forward_context=forward_context,
+            num_tokens=16,
+            vllm_config=MagicMock(),
+        )
+
+        mock_update_begin.assert_called_once()
+        mock_update_end.assert_called_once()
+        mock_fia.out.assert_called_once()
+        _, kwargs = mock_fia.out.call_args
+        assert kwargs["input_layout"] == "BNSD"
+        assert kwargs["block_table"].tolist() == metadata.block_tables.tolist()
+        assert kwargs["actual_seq_lengths_kv"] == metadata.seq_lens_list
+        assert kwargs["key_antiquant_mode"] == 0
+        assert kwargs["value_antiquant_mode"] == 0
 
     @patch('torch_npu._npu_reshape_and_cache')
     @patch('torch_npu.npu_fused_infer_attention_score')

@@ -61,6 +61,20 @@ from vllm_ascend.utils import weak_ref_tensors
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
+C8_DECODE_GRAPH_PARAM_TAG = "c8_decode"
+C8_DECODE_FULL_GRAPH_CHUNK_SIZE = 2
+
+
+def _is_aclgraph_capturing() -> bool:
+    if _EXTRA_CTX.capturing:
+        return True
+    is_current_stream_capturing = getattr(torch.npu, "is_current_stream_capturing", None)
+    if is_current_stream_capturing is None:
+        return False
+    try:
+        return bool(is_current_stream_capturing())
+    except RuntimeError:
+        return False
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -262,6 +276,70 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     def reorder_batch(self, input_batch, scheduler_output: "SchedulerOutput") -> bool:
         return False
 
+    @staticmethod
+    def _flatten_mtp_decode_metadata(
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_list: list[int],
+        query_lens: torch.Tensor,
+        computed_lens: torch.Tensor,
+        num_reqs: int,
+        num_decodes: int,
+        num_prefills: int,
+        num_decode_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[int], int, int]:
+        """Flatten multi-token decode requests before attention forward.
+
+        FIA treats the query dimension as flattened tokens. For MTP each decode
+        token must therefore get its own block-table row and KV length. Keeping
+        this transformation in metadata construction also avoids dynamic
+        repeat_interleave inside ACL graph replay.
+        """
+        if num_decode_tokens <= num_decodes:
+            actual_seq_lengths_q = torch.cumsum(query_lens[:num_reqs], dim=0).tolist()
+            return block_table, seq_lens, seq_lens_list, actual_seq_lengths_q, num_decodes, num_decode_tokens
+
+        decode_query_lens = [int(v) for v in query_lens[:num_decodes].tolist()]
+        flattened_decode_seq_lens: list[int] = []
+        for computed_len, query_len in zip(computed_lens[:num_decodes].tolist(), decode_query_lens):
+            flattened_decode_seq_lens.extend(int(computed_len) + step for step in range(1, query_len + 1))
+
+        if len(flattened_decode_seq_lens) != num_decode_tokens:
+            raise ValueError(
+                "MTP decode metadata is inconsistent: "
+                f"flattened_decode_seq_lens={len(flattened_decode_seq_lens)}, "
+                f"num_decode_tokens={num_decode_tokens}"
+            )
+
+        repeat_counts = torch.tensor(decode_query_lens, dtype=torch.long, device=block_table.device)
+        flattened_block_table = torch.repeat_interleave(block_table[:num_decodes], repeat_counts, dim=0)
+
+        if num_prefills > 0:
+            flattened_block_table = torch.cat(
+                [flattened_block_table, block_table[num_decodes:num_reqs]], dim=0
+            )
+            flattened_seq_lens = flattened_decode_seq_lens + seq_lens_list[num_decodes:num_reqs]
+            prefill_query_lens = [int(v) for v in query_lens[num_decodes:num_reqs].tolist()]
+        else:
+            flattened_seq_lens = flattened_decode_seq_lens
+            prefill_query_lens = []
+
+        actual_seq_lengths_q = list(range(1, num_decode_tokens + 1))
+        q_end = num_decode_tokens
+        for query_len in prefill_query_lens:
+            q_end += query_len
+            actual_seq_lengths_q.append(q_end)
+
+        seq_lens = torch.tensor(flattened_seq_lens, dtype=seq_lens.dtype)
+        return (
+            flattened_block_table,
+            seq_lens,
+            flattened_seq_lens,
+            actual_seq_lengths_q,
+            num_decode_tokens,
+            num_decode_tokens,
+        )
+
     def build(
         self,
         common_prefix_len: int,
@@ -281,38 +359,27 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         seq_lens_list = seq_lens.tolist()
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
 
-        if (
-            self.speculative_config is not None
-            and num_prefills == 0
-            and num_decode_tokens > num_decodes
-        ):
+        if self.speculative_config is not None and num_decode_tokens > num_decodes:
             query_lens = query_start_loc_cpu[1 : num_reqs + 1] - query_start_loc_cpu[:num_reqs]
             computed_lens = common_attn_metadata.num_computed_tokens_cpu[:num_reqs]
-
-            flattened_seq_lens: list[int] = []
-            repeat_counts: list[int] = []
-            for computed_len, query_len in zip(computed_lens.tolist(), query_lens.tolist()):
-                query_len = int(query_len)
-                repeat_counts.append(query_len)
-                flattened_seq_lens.extend(
-                    int(computed_len) + step for step in range(1, query_len + 1)
-                )
-
-            if flattened_seq_lens:
-                # FIA TND treats each decode query token as a separate q batch.
-                # For MTP target verification, each token must see only the KV
-                # prefix up to its own position, so KV lengths are expanded per token.
-                seq_lens = torch.tensor(flattened_seq_lens, dtype=seq_lens.dtype)
-                seq_lens_list = flattened_seq_lens
-                actual_seq_lengths_q = list(range(1, len(flattened_seq_lens) + 1))
-                num_decodes = len(flattened_seq_lens)
-                num_decode_tokens = len(flattened_seq_lens)
-                repeat_counts_tensor = torch.tensor(
-                    repeat_counts, dtype=torch.long, device=block_table.device
-                )
-                block_table = torch.repeat_interleave(
-                    block_table[:num_reqs], repeat_counts_tensor, dim=0
-                )
+            (
+                block_table,
+                seq_lens,
+                seq_lens_list,
+                actual_seq_lengths_q,
+                num_decodes,
+                num_decode_tokens,
+            ) = self._flatten_mtp_decode_metadata(
+                block_table,
+                seq_lens,
+                seq_lens_list,
+                query_lens,
+                computed_lens,
+                num_reqs,
+                num_decodes,
+                num_prefills,
+                num_decode_tokens,
+            )
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
@@ -507,13 +574,79 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if _EXTRA_CTX.is_draft_model:
                 attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
             attn_count = 0
+
+            def get_current_attn_metadata(layer_name):
+                nonlocal attn_count
+                if _EXTRA_CTX.is_draft_model:
+                    draft_step = attn_count // num_layers
+                    metadata = attn_metadata[draft_step][layer_name]
+                    attn_count = attn_count + 1
+                    return metadata
+                return attn_metadata[layer_name]
+
             with torch.npu.stream(update_stream):
-                for key, param, handle, event in zip(
-                    attn_keys,
+                for param, handle, event in zip(
                     graph_params.attn_params[num_tokens],
                     graph_params.handles[num_tokens],
                     graph_params.events[num_tokens],
                 ):
+                    if param[0] == C8_DECODE_GRAPH_PARAM_TAG:
+                        (
+                            _tag,
+                            layer_name,
+                            chunk_start,
+                            chunk_end,
+                            query,
+                            key_cache,
+                            value,
+                            key_antiquant_scale,
+                            key_antiquant_offset,
+                            value_antiquant_scale,
+                            value_antiquant_offset,
+                            block_size,
+                            num_kv_heads,
+                            num_heads,
+                            scale,
+                            attn_output,
+                            softmax_lse,
+                        ) = param
+                        metadata = get_current_attn_metadata(layer_name)
+                        seq_lens = metadata.seq_lens_list[chunk_start:chunk_end]
+                        block_tables = metadata.block_tables[chunk_start:chunk_end]
+
+                        torch.npu.graph_task_update_begin(update_stream, handle)
+                        torch_npu.npu_fused_infer_attention_score.out(
+                            query=query,
+                            key=key_cache,
+                            value=value,
+                            key_antiquant_scale=key_antiquant_scale,
+                            key_antiquant_offset=key_antiquant_offset,
+                            value_antiquant_scale=value_antiquant_scale,
+                            value_antiquant_offset=value_antiquant_offset,
+                            block_table=block_tables,
+                            actual_seq_lengths_kv=seq_lens,
+                            num_heads=num_heads,
+                            num_key_value_heads=num_kv_heads,
+                            input_layout="BNSD",
+                            scale=scale,
+                            block_size=block_size,
+                            key_antiquant_mode=0,
+                            value_antiquant_mode=0,
+                            sparse_mode=0,
+                            out=[attn_output, softmax_lse],
+                        )
+                        torch.npu.graph_task_update_end(update_stream)
+                        event.record(update_stream)
+                        continue
+
+                    key = attn_keys[attn_count % num_layers]
+                    metadata = get_current_attn_metadata(key)
+                    if not _EXTRA_CTX.is_draft_model:
+                        attn_count = attn_count + 1
+                    seq_lens = metadata.seq_lens_list
+                    actual_seq_lengths_q = metadata.actual_seq_lengths_q
+                    block_tables = metadata.block_tables
+
                     (
                         query,
                         key_cache,
@@ -529,17 +662,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         attn_output,
                         softmax_lse,
                     ) = param
-
-                    if _EXTRA_CTX.is_draft_model:
-                        draft_step = attn_count // num_layers
-                        seq_lens = attn_metadata[draft_step][key].seq_lens_list
-                        actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
-                        block_tables = attn_metadata[draft_step][key].block_tables
-                        attn_count = attn_count + 1
-                    else:
-                        seq_lens = attn_metadata[key].seq_lens_list
-                        actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
-                        block_tables = attn_metadata[key].block_tables
 
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu.npu_fused_infer_attention_score.out(
@@ -669,7 +791,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         graph_params = get_graph_params()
         num_tokens = query.shape[0]
-        if _EXTRA_CTX.capturing:
+        if _is_aclgraph_capturing():
             # Get workspace from cache or calculate it if not present.
             workspace = graph_params.workspaces.get(num_tokens)
             if workspace is None:
@@ -806,7 +928,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
-        if _EXTRA_CTX.capturing:
+        if _is_aclgraph_capturing():
             attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
@@ -882,7 +1004,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if _EXTRA_CTX.capturing:
+        if _is_aclgraph_capturing():
             return self.full_graph_pa(query, attn_metadata, output)
         torch_npu._npu_paged_attention(
             query=query,
@@ -1078,7 +1200,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             return output
 
         self._prepare_c8_scales(layer, query.device)
-        if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+        is_decode_like = attn_metadata.num_prefills == 0 and attn_metadata.num_decode_tokens > 0
+        if is_decode_like:
             return self._forward_c8_decode(query, attn_metadata, output, layer)
         elif attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill:
             return self._forward_c8_chunked_prefill(query, float_key, float_value, attn_metadata, output, layer)
@@ -1201,33 +1324,118 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         layer: AttentionLayer,
     ) -> torch.Tensor:
         """C8 decode via FIA V1 BNSD with native paged INT8 KV + perchannel antiquant."""
+        if _is_aclgraph_capturing():
+            return self._full_graph_c8_decode(query, attn_metadata, output, layer)
+
         num_block, block_size, _, _ = self.key_cache.shape  # type: ignore[attr-defined]
         assert block_size % 32 == 0, f"C8 INT8 KV cache requires block_size to be a multiple of 32, got {block_size}"
         key = self.key_cache.view(num_block, block_size, -1)  # type: ignore[attr-defined]
         value = self.value_cache.view(num_block, block_size, -1)  # type: ignore[attr-defined]
         batch_size = len(attn_metadata.seq_lens_list)
 
-        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-            query[:batch_size].unsqueeze(2),
-            key,
-            value,
-            key_antiquant_scale=layer._c8_k_aq_scale,
-            key_antiquant_offset=layer._c8_k_aq_offset,
-            value_antiquant_scale=layer._c8_v_aq_scale,
-            value_antiquant_offset=layer._c8_v_aq_offset,
-            block_table=attn_metadata.block_tables,
-            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
-            num_heads=self.num_heads,
-            num_key_value_heads=self.num_kv_heads,
-            input_layout="BNSD",
-            scale=self.scale,
-            block_size=block_size,
-            key_antiquant_mode=0,
-            value_antiquant_mode=0,
-            sparse_mode=0,
-        )
-        attn_output = attn_output.squeeze(2)
-        output[:batch_size] = attn_output
+        for chunk_start in range(0, batch_size, C8_DECODE_FULL_GRAPH_CHUNK_SIZE):
+            chunk_end = min(chunk_start + C8_DECODE_FULL_GRAPH_CHUNK_SIZE, batch_size)
+            query_for_attention = query[chunk_start:chunk_end].unsqueeze(2)
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                query_for_attention,
+                key,
+                value,
+                key_antiquant_scale=layer._c8_k_aq_scale,
+                key_antiquant_offset=layer._c8_k_aq_offset,
+                value_antiquant_scale=layer._c8_v_aq_scale,
+                value_antiquant_offset=layer._c8_v_aq_offset,
+                block_table=attn_metadata.block_tables[chunk_start:chunk_end],
+                actual_seq_lengths_kv=attn_metadata.seq_lens_list[chunk_start:chunk_end],
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BNSD",
+                scale=self.scale,
+                block_size=block_size,
+                key_antiquant_mode=0,
+                value_antiquant_mode=0,
+                sparse_mode=0,
+            )
+            output[chunk_start:chunk_end] = attn_output.squeeze(2)
+        return output
+
+    def _full_graph_c8_decode(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        layer: AttentionLayer,
+    ) -> torch.Tensor:
+        """Register C8 decode FIA parameters for full ACL graph replay.
+
+        Native C8 decode uses the BNSD FIA path with paged INT8 KV cache and
+        per-channel antiquant parameters. Like the regular TND FIA path, the
+        per-step block table and KV lengths are dynamic, so full graph replay
+        must update this operator's task parameters before each replay.
+        """
+        num_block, block_size, _, _ = self.key_cache.shape  # type: ignore[attr-defined]
+        assert block_size % 32 == 0, f"C8 INT8 KV cache requires block_size to be a multiple of 32, got {block_size}"
+        key = self.key_cache.view(num_block, block_size, -1)  # type: ignore[attr-defined]
+        value = self.value_cache.view(num_block, block_size, -1)  # type: ignore[attr-defined]
+        num_tokens = query.shape[0]
+        graph_params = get_draft_graph_params() if _EXTRA_CTX.is_draft_model else get_graph_params()
+        layer_name = layer.layer_name
+        for chunk_start in range(0, num_tokens, C8_DECODE_FULL_GRAPH_CHUNK_SIZE):
+            chunk_end = min(chunk_start + C8_DECODE_FULL_GRAPH_CHUNK_SIZE, num_tokens)
+            query_for_attention = query[chunk_start:chunk_end].unsqueeze(2)
+            attn_output = torch.empty_like(query_for_attention)
+            softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+
+            stream = torch_npu.npu.current_stream()
+            event = torch.npu.ExternalEvent()
+            event.wait(stream)
+            event.reset(stream)
+            graph_params.events[num_tokens].append(event)
+            graph_params.attn_params[num_tokens].append(
+                (
+                    C8_DECODE_GRAPH_PARAM_TAG,
+                    layer_name,
+                    chunk_start,
+                    chunk_end,
+                    weak_ref_tensors(query_for_attention),
+                    weak_ref_tensors(key),
+                    weak_ref_tensors(value),
+                    weak_ref_tensors(layer._c8_k_aq_scale),
+                    weak_ref_tensors(layer._c8_k_aq_offset),
+                    weak_ref_tensors(layer._c8_v_aq_scale),
+                    weak_ref_tensors(layer._c8_v_aq_offset),
+                    block_size,
+                    self.num_kv_heads,
+                    self.num_heads,
+                    self.scale,
+                    weak_ref_tensors(attn_output),
+                    weak_ref_tensors(softmax_lse),
+                )
+            )
+
+            torch.npu.graph_task_group_begin(stream)
+            torch_npu.npu_fused_infer_attention_score.out(
+                query=query_for_attention,
+                key=key,
+                value=value,
+                key_antiquant_scale=layer._c8_k_aq_scale,
+                key_antiquant_offset=layer._c8_k_aq_offset,
+                value_antiquant_scale=layer._c8_v_aq_scale,
+                value_antiquant_offset=layer._c8_v_aq_offset,
+                block_table=attn_metadata.block_tables[chunk_start:chunk_end],
+                actual_seq_lengths_kv=attn_metadata.seq_lens_list[chunk_start:chunk_end],
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BNSD",
+                scale=self.scale,
+                block_size=block_size,
+                key_antiquant_mode=0,
+                value_antiquant_mode=0,
+                sparse_mode=0,
+                out=[attn_output, softmax_lse],
+            )
+            handle = torch.npu.graph_task_group_end(stream)
+            graph_params.handles[num_tokens].append(handle)
+            output[chunk_start:chunk_end] = attn_output.squeeze(2)
         return output
 
     def _forward_c8_chunked_prefill(

@@ -97,6 +97,7 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_pag
 # yapf: disable
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
+    get_graph_params,
     set_draft_graph_params,
     set_graph_params,
     update_full_graph_params,
@@ -129,6 +130,7 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.quantization.utils import uses_c8_kv_cache
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -347,6 +349,7 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+        self.uses_c8_kv_cache = uses_c8_kv_cache(vllm_config)
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -1376,7 +1379,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
-                skip_compiled=has_encoder_input,
+                skip_compiled=has_encoder_input or self.uses_c8_kv_cache or cudagraph_mode == CUDAGraphMode.FULL,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -1814,21 +1817,21 @@ class NPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
-        hidden_states = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
         forward_context = get_forward_context()
         assert forward_context is not None
-        if (
+        should_update_full_graph_params = (
             forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
             and not forward_context.capturing
             and not self.use_sparse
+        )
+        graph_params = get_graph_params()
+        if (
+            should_update_full_graph_params
+            and graph_params is not None
+            and graph_params.handles.get(num_tokens_padded)
         ):
             assert positions is not None
+            torch.npu.current_stream().synchronize()
             update_full_graph_params(
                 self.attn_backend,
                 self.update_stream,
@@ -1838,6 +1841,13 @@ class NPUModelRunner(GPUModelRunner):
                 self.speculative_config,
                 positions.shape[0],
             )
+        hidden_states = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **model_kwargs,
+        )
         if get_forward_context().flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
@@ -2489,6 +2499,7 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
+                skip_compiled=self.uses_c8_kv_cache or cudagraph_runtime_mode == CUDAGraphMode.FULL,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds

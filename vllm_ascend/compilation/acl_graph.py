@@ -102,6 +102,37 @@ class ACLGraphWrapper:
         # in case we need to access the original runnable.
         return self.runnable
 
+    @staticmethod
+    def _prepare_c8_attention_scales(runnable: Callable, device: torch.device) -> None:
+        modules = getattr(runnable, "modules", None)
+        if modules is None:
+            return
+        for module in modules():
+            impl = getattr(module, "impl", None)
+            if (
+                hasattr(module, "k_cache_scale")
+                and hasattr(module, "k_cache_offset")
+                and hasattr(module, "v_cache_scale")
+                and hasattr(module, "v_cache_offset")
+                and hasattr(impl, "_prepare_c8_scales")
+            ):
+                impl._prepare_c8_scales(module, device)
+
+    @staticmethod
+    def _first_tensor(*values) -> torch.Tensor | None:
+        for value in values:
+            if isinstance(value, torch.Tensor):
+                return value
+            if isinstance(value, dict):
+                found = ACLGraphWrapper._first_tensor(*value.values())
+                if found is not None:
+                    return found
+            elif isinstance(value, (list, tuple)):
+                found = ACLGraphWrapper._first_tensor(*value)
+                if found is not None:
+                    return found
+        return None
+
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
@@ -135,6 +166,9 @@ class ACLGraphWrapper:
             input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             entry.input_addresses = input_addresses
             aclgraph = torch.npu.NPUGraph()
+            first_tensor = self._first_tensor(args, kwargs)
+            if first_tensor is not None:
+                self._prepare_c8_attention_scales(self.runnable, first_tensor.device)
 
             with ExitStack() as stack:
                 if self.aclgraph_options.gc_disable:

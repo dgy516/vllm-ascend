@@ -43,9 +43,10 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_co
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, get_draft_graph_params, update_full_graph_params
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.quantization.utils import uses_c8_kv_cache
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
@@ -92,6 +93,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         super().__init__(vllm_config, device, runner)
 
         self.use_async_scheduling = self.vllm_config.scheduler_config.async_scheduling
+        self.uses_c8_kv_cache = uses_c8_kv_cache(vllm_config)
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
         self.decode_threshold = 1 + self.num_speculative_tokens
         self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)
@@ -425,11 +427,22 @@ class SpecDecodeBaseProposer(EagleProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
+            skip_compiled=self.uses_c8_kv_cache or aclgraph_runtime_mode == CUDAGraphMode.FULL,
         ):
             # Reset MOE layer index before first model call
             forward_context = get_forward_context()
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
+
+            graph_params = get_draft_graph_params()
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not _EXTRA_CTX.capturing
+                and graph_params is not None
+                and graph_params.handles.get(num_tokens)
+            ):
+                torch.npu.current_stream().synchronize()
+                self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
 
             self._runnable(
                 num_input_tokens=num_tokens,
@@ -441,9 +454,6 @@ class SpecDecodeBaseProposer(EagleProposer):
                 multi_steps_attn_metadata=multi_steps_attn_metadata,
                 num_tokens=num_tokens,
             )
-            forward_context = get_forward_context()
-            if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
-                self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
 
     def _propose(
         self,
@@ -676,11 +686,21 @@ class SpecDecodeBaseProposer(EagleProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
+            skip_compiled=self.uses_c8_kv_cache or aclgraph_runtime_mode == CUDAGraphMode.FULL,
         ):
             # Reset MOE layer index for forward pass
             forward_context = get_forward_context()
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
+
+            graph_params = get_draft_graph_params()
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and graph_params is not None
+                and graph_params.handles.get(num_input_tokens)
+            ):
+                torch.npu.current_stream().synchronize()
+                self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
 
             draft_token_ids = self._runnable(
                 num_input_tokens=num_input_tokens,
@@ -692,10 +712,6 @@ class SpecDecodeBaseProposer(EagleProposer):
                 num_tokens=num_tokens,
                 is_prefill=attn_metadata_i.num_prefills,
             )
-
-            forward_context = get_forward_context()
-            if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
-                self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
         return draft_token_ids
 
     def _run_merged_draft(

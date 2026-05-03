@@ -1,3 +1,5 @@
+import types
+
 import torch
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
@@ -99,6 +101,49 @@ def _c8_kv_scale_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.T
         param.data.copy_(loaded_weight)
 
 
+def _c8_attention_forward_without_custom_op(
+    layer: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output_shape: torch.Size | None = None,
+) -> torch.Tensor:
+    """Run C8 attention through the backend directly.
+
+    The vLLM unified attention custom op hides the Python backend body from ACL
+    full-graph task registration. C8 full-graph decode needs that backend body
+    to register FIA task handles, so C8 attention bypasses the unified op.
+    """
+    if layer.calculate_kv_scales:
+        torch.ops.vllm.maybe_calc_kv_scales(query, key, value, layer.layer_name)
+
+    output_dtype = query.dtype
+    if layer.query_quant is not None:
+        query, _ = layer.query_quant(query, layer._q_scale)
+
+    if not layer.use_output:
+        raise NotImplementedError("C8 KV cache attention requires an output buffer on Ascend")
+
+    if output_shape is None:
+        output_shape = torch.Size((query.shape[0], layer.num_heads * layer.head_size_v))
+
+    output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+    hidden_size = output_shape[-1]
+
+    query = query.view(-1, layer.num_heads, layer.head_size)
+    output = output.view(-1, layer.num_heads, layer.head_size_v)
+    if key is not None:
+        key = key.view(-1, layer.num_kv_heads, layer.head_size)
+    if value is not None:
+        value = value.view(-1, layer.num_kv_heads, layer.head_size_v)
+
+    from vllm.model_executor.layers.attention.attention import get_attention_context
+
+    attn_metadata, _, kv_cache, _ = get_attention_context(layer.layer_name)
+    layer.impl.forward(layer, query, key, value, kv_cache, attn_metadata, output=output)
+    return output.view(-1, hidden_size)
+
+
 class AscendC8KVCacheAttentionMethod(AscendAttentionScheme):
     """C8 INT8 KV cache quantization for dense-attention models (e.g. Qwen3)."""
 
@@ -109,6 +154,12 @@ class AscendC8KVCacheAttentionMethod(AscendAttentionScheme):
     def create_weights(self, layer: torch.nn.Module) -> None:
         # Override kv_cache_torch_dtype so Attention.get_kv_cache_spec returns int8 automatically.
         layer.kv_cache_torch_dtype = torch.int8
+        # C8 full-graph replay has dynamic FIA metadata (block tables and
+        # sequence lengths). The opaque attention custom op hides the backend
+        # call from ACL graph task registration, so use the direct Python call
+        # path and let AscendC8AttentionBackendImpl register/update FIA tasks.
+        layer.use_direct_call = True
+        layer.forward = types.MethodType(_c8_attention_forward_without_custom_op, layer)
         # Upgrade impl to the C8-specific subclass so the C8 forward path is always used.
         if hasattr(layer, "impl"):
             from vllm_ascend.attention.attention_v1 import AscendC8AttentionBackendImpl

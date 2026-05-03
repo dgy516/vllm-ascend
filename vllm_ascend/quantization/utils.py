@@ -128,6 +128,12 @@ def detect_quantization_method(model: str, revision: str | None = None) -> str |
     return None
 
 
+def uses_c8_kv_cache(vllm_config) -> bool:
+    quant_config = getattr(vllm_config, "quant_config", None)
+    quant_description = getattr(quant_config, "quant_description", None)
+    return isinstance(quant_description, dict) and quant_description.get("kv_cache_type") == "C8"
+
+
 def maybe_auto_detect_quantization(vllm_config) -> None:
     """Auto-detect and apply the quantization method on *vllm_config*.
 

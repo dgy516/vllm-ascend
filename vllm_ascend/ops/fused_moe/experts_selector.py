@@ -111,6 +111,10 @@ def check_npu_moe_gating_top_k(
     scoring_func: str = "softmax",
     custom_routing_function: Callable | None = None,
 ):
+    # Current CANN MoeGatingTopK tiling rejects renorm=1. Fall back to the
+    # native top-k path, which applies the same renormalization explicitly.
+    if renormalize:
+        return False
     if scoring_func == "sigmoid" and not renormalize:  # sigmoid + renorm=0 is not supported in current branch
         return False
     if custom_routing_function is not None:

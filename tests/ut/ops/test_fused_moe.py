@@ -23,7 +23,10 @@ from pytest_mock import MockerFixture
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_forward_context import MoECommType
-from vllm_ascend.ops.fused_moe.experts_selector import select_experts
+from vllm_ascend.ops.fused_moe.experts_selector import (
+    check_npu_moe_gating_top_k,
+    select_experts,
+)
 from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 from vllm_ascend.ops.fused_moe.moe_mlp import cumsum_group_list, unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
@@ -288,6 +291,19 @@ class MockQuantMethod(nn.Module):
 
 
 class TestExpertsSelector:
+
+    def test_npu_moe_gating_top_k_rejects_renormalize(self):
+        hidden_states = torch.randn(8, 256)
+
+        assert not check_npu_moe_gating_top_k(
+            hidden_states=hidden_states,
+            top_k=8,
+            renormalize=True,
+            topk_group=None,
+            num_expert_group=None,
+            scoring_func="softmax",
+            custom_routing_function=None,
+        )
 
     @pytest.mark.parametrize("global_num_experts", [256, 128])
     def test_select_experts(self, mock_dist_env, mock_moe_env,

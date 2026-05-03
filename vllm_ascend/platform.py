@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import os
+import sysconfig
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -532,14 +533,34 @@ class NPUPlatform(Platform):
         global _CUSTOM_OP_REGISTERED
         if _CUSTOM_OP_REGISTERED:
             return
-        CUR_DIR = os.path.dirname(os.path.realpath(__file__))
-        CUSTOM_OPP_PATH = os.path.join(CUR_DIR, "_cann_ops_custom", "vendors", "vllm-ascend")
-        if os.path.exists(CUSTOM_OPP_PATH):
+        cur_dir = os.path.dirname(os.path.realpath(__file__))
+        custom_opp_candidates = [
+            os.path.join(cur_dir, "_cann_ops_custom", "vendors", "vllm-ascend"),
+        ]
+        purelib = sysconfig.get_paths().get("purelib")
+        if purelib:
+            custom_opp_candidates.append(
+                os.path.join(
+                    purelib,
+                    "vllm_ascend",
+                    "_cann_ops_custom",
+                    "vendors",
+                    "vllm-ascend",
+                )
+            )
+
+        for custom_opp_path in custom_opp_candidates:
+            if os.path.exists(custom_opp_path):
+                break
+        else:
+            custom_opp_path = None
+
+        if custom_opp_path is not None:
             current_cust_opp_path = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
             if current_cust_opp_path:
-                os.environ["ASCEND_CUSTOM_OPP_PATH"] = f"{CUSTOM_OPP_PATH}:{current_cust_opp_path}"
+                os.environ["ASCEND_CUSTOM_OPP_PATH"] = f"{custom_opp_path}:{current_cust_opp_path}"
             else:
-                os.environ["ASCEND_CUSTOM_OPP_PATH"] = CUSTOM_OPP_PATH
+                os.environ["ASCEND_CUSTOM_OPP_PATH"] = custom_opp_path
         _CUSTOM_OP_REGISTERED = True
 
     @classmethod
