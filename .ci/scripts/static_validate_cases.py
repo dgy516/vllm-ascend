@@ -8,9 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from deploy_case_lib import (
+    ALLOWED_SOCS,
     build_vllm_serve_command,
+    case_card_count,
     case_name,
+    case_soc,
     command_to_shell,
+    docker_config,
     first_service,
     load_case,
     read_case_list,
@@ -64,6 +68,58 @@ def _validate_flag_types(command: list[str]) -> list[str]:
     return errors
 
 
+def _flag_value(command: list[str], flag: str) -> str | None:
+    for index, token in enumerate(command):
+        if token == flag and index + 1 < len(command):
+            return command[index + 1]
+        if token.startswith(f"{flag}="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _validate_runtime_resources(case: dict[str, Any], command: list[str]) -> list[str]:
+    errors: list[str] = []
+    card_count = case_card_count(case)
+    if card_count < 1:
+        errors.append(f"{case_name(case)}: card_count must be >= 1")
+    if case_soc(case) not in ALLOWED_SOCS:
+        errors.append(f"{case_name(case)}: soc must be one of {sorted(ALLOWED_SOCS)}")
+
+    tensor_parallel = _flag_value(command, "--tensor-parallel-size")
+    if tensor_parallel is not None:
+        try:
+            tp_size = int(tensor_parallel)
+            if tp_size > card_count:
+                errors.append(
+                    f"{case_name(case)}: --tensor-parallel-size {tp_size} exceeds card_count {card_count}"
+                )
+        except ValueError:
+            errors.append(f"{case_name(case)}: --tensor-parallel-size must be an integer")
+
+    docker = docker_config(case)
+    if docker.get("enabled") is not True:
+        errors.append(f"{case_name(case)}: runtime.docker.enabled must be true")
+    if not docker.get("image"):
+        errors.append(f"{case_name(case)}: runtime.docker.image is required")
+    if docker.get("network") != "host":
+        errors.append(f"{case_name(case)}: runtime.docker.network must be host")
+    if not docker.get("shm_size"):
+        errors.append(f"{case_name(case)}: runtime.docker.shm_size is required")
+    mounts = docker.get("mounts")
+    if not isinstance(mounts, list) or not mounts:
+        errors.append(f"{case_name(case)}: runtime.docker.mounts must be a non-empty list")
+    else:
+        for index, mount in enumerate(mounts):
+            if not isinstance(mount, dict):
+                errors.append(f"{case_name(case)}: runtime.docker.mounts[{index}] must be a mapping")
+                continue
+            if not mount.get("source") or not mount.get("target"):
+                errors.append(f"{case_name(case)}: runtime.docker.mounts[{index}] requires source and target")
+            if mount.get("mode") not in {"ro", "rw"}:
+                errors.append(f"{case_name(case)}: runtime.docker.mounts[{index}].mode must be ro or rw")
+    return errors
+
+
 def _check_model_path(case: dict[str, Any], model_root: str) -> list[str]:
     service = first_service(case)
     model = str((service.get("vllm") or {}).get("model") or "")
@@ -108,6 +164,7 @@ def main() -> int:
             command = build_vllm_serve_command(case, service, {"MODEL_ROOT": args.model_root})
             entry["command"] = command_to_shell(command)
             errors.extend(_validate_flag_types(command))
+            errors.extend(_validate_runtime_resources(case, command))
             if args.check_model_path:
                 errors.extend(_check_model_path(case, args.model_root))
         except Exception as exc:  # noqa: BLE001 - convert to clear JSON report

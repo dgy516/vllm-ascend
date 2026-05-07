@@ -31,6 +31,8 @@
 
 {{ topology }}
 
+本 case 在 Jenkins runtime 中申请 `{{ card_count }}` 张 Ascend 卡。卡号和端口由 `.ci/scripts/with_runtime_allocation.py` 在宿主机分配，并通过 `ASCEND_RT_VISIBLE_DEVICES` 和 `VLLM_CI_ALLOCATED_PORTS` 注入容器。
+
 ## 5. 环境变量
 
 ```bash
@@ -39,9 +41,21 @@
 
 ## 6. 启动服务命令
 
+### vLLM 命令
+
 ```bash
 {{ serve_command }}
 ```
+
+### Docker runtime 示例
+
+```bash
+{{ docker_command }}
+```
+
+Docker 配置：
+
+{{ docker_runtime }}
 
 ## 7. vLLM config 示例
 
@@ -84,6 +98,7 @@
 ## 13. 注意事项
 
 - Jenkins 默认 `RUN_ASCEND=false`，不会在静态流程中启动真实模型。
-- 大模型 case 需要独占 Ascend 资源，建议配置 `ASCEND_LOCK_LABEL`。
+- 一个 Jenkins parallel branch 对应一个 Docker 容器，容器只看到分配到的 Ascend 卡。
+- 大模型 case 会按 `requirements.hardware.card_count` 申请更多卡；`ASCEND_LOCK_LABEL` 只作为可选外层保护。
 - `reports/` 和 `logs/` 是运行时产物目录，不应提交到 Git。
 - PD、多服务和多机场景在第一版中只预留结构，runner 暂不执行。

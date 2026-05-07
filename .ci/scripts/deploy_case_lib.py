@@ -16,6 +16,7 @@ import yaml
 API_VERSION = "llm-ci/v1"
 KIND = "DeployCase"
 ALLOWED_LEVELS = {"static", "smoke", "nightly", "release", "benchmark"}
+ALLOWED_SOCS = {"A2", "A3", "any"}
 STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
@@ -134,6 +135,28 @@ def runtime_env(case: dict[str, Any]) -> dict[str, str]:
     return {str(k): str(v) for k, v in env.items()}
 
 
+def hardware_config(case: dict[str, Any]) -> dict[str, Any]:
+    hardware = case.get("requirements", {}).get("hardware") or {}
+    return hardware if isinstance(hardware, dict) else {}
+
+
+def docker_config(case: dict[str, Any]) -> dict[str, Any]:
+    docker = case.get("runtime", {}).get("docker") or {}
+    return docker if isinstance(docker, dict) else {}
+
+
+def case_card_count(case: dict[str, Any]) -> int:
+    value = hardware_config(case).get("card_count", 1)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise DeployCaseError(f"{case_name(case)}: requirements.hardware.card_count must be an integer") from None
+
+
+def case_soc(case: dict[str, Any]) -> str:
+    return str(hardware_config(case).get("soc", "any"))
+
+
 def expand_text(value: Any, env: dict[str, str] | None = None) -> str:
     merged_env = dict(os.environ)
     if env:
@@ -148,7 +171,67 @@ def expand_text(value: Any, env: dict[str, str] | None = None) -> str:
 
 
 def _has_flag(args: list[str], flag: str) -> bool:
-    return flag in args
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in args)
+
+
+def set_cli_flag_value(args: list[str], flag: str, value: Any) -> None:
+    value_text = str(value)
+    for index, arg in enumerate(args):
+        if arg == flag:
+            if index + 1 < len(args) and not args[index + 1].startswith("--"):
+                args[index + 1] = value_text
+            else:
+                args.insert(index + 1, value_text)
+            return
+        if arg.startswith(f"{flag}="):
+            args[index] = f"{flag}={value_text}"
+            return
+    args.extend([flag, value_text])
+
+
+def _as_int_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+    result: list[int] = []
+    for item in items:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            raise DeployCaseError(f"allocation value must be an integer, got {item!r}") from None
+    return result
+
+
+def allocation_cards(allocation: dict[str, Any] | None) -> list[int]:
+    if not allocation:
+        return []
+    return _as_int_list(allocation.get("cards") or allocation.get("allocated_cards"))
+
+
+def allocation_ports(allocation: dict[str, Any] | None) -> list[int]:
+    if not allocation:
+        return []
+    return _as_int_list(allocation.get("ports") or allocation.get("allocated_ports"))
+
+
+def apply_allocation(case: dict[str, Any], allocation: dict[str, Any] | None) -> None:
+    ports = allocation_ports(allocation)
+    if not ports:
+        return
+    services = case.get("services") or []
+    if len(ports) < len(services):
+        raise DeployCaseError(
+            f"{case_name(case)}: allocation provides {len(ports)} port(s) "
+            f"for {len(services)} service(s)"
+        )
+    for service, port in zip(services, ports, strict=False):
+        if isinstance(service, dict):
+            service["port"] = port
 
 
 def build_vllm_serve_command(
@@ -175,13 +258,13 @@ def build_vllm_serve_command(
         raise DeployCaseError(f"{case_name(case)}: vllm.args must be a list")
     args = [expand_text(arg, env) for arg in raw_args]
 
-    if service.get("host") is not None and not _has_flag(args, "--host"):
-        args.extend(["--host", str(service["host"])])
-    if service.get("port") is not None and not _has_flag(args, "--port"):
-        args.extend(["--port", str(service["port"])])
+    if service.get("host") is not None:
+        set_cli_flag_value(args, "--host", service["host"])
+    if service.get("port") is not None:
+        set_cli_flag_value(args, "--port", service["port"])
     served_name = served_model_name(service)
-    if served_name and served_name != model and not _has_flag(args, "--served-model-name"):
-        args.extend(["--served-model-name", served_name])
+    if served_name and served_name != model:
+        set_cli_flag_value(args, "--served-model-name", served_name)
 
     return ["vllm", "serve", model, *args]
 
@@ -226,11 +309,20 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
         "doc.difficulty",
         "doc.generated_warning",
         "requirements.hardware",
+        "requirements.hardware.soc",
+        "requirements.hardware.card_count",
+        "requirements.hardware.allow_parallel_on_host",
         "requirements.software",
         "requirements.model",
         "runtime.image",
         "runtime.workdir",
         "runtime.env",
+        "runtime.docker",
+        "runtime.docker.enabled",
+        "runtime.docker.image",
+        "runtime.docker.network",
+        "runtime.docker.shm_size",
+        "runtime.docker.mounts",
         "checks.readiness",
         "tests.smoke",
         "tests.benchmark",
@@ -243,6 +335,31 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
     level = get_path(case, "metadata.level")
     if level not in ALLOWED_LEVELS:
         errors.append(f"{label}: metadata.level must be one of {sorted(ALLOWED_LEVELS)}")
+
+    hardware = hardware_config(case)
+    soc = hardware.get("soc")
+    if soc not in ALLOWED_SOCS:
+        errors.append(f"{label}: requirements.hardware.soc must be one of {sorted(ALLOWED_SOCS)}")
+    try:
+        card_count = int(hardware.get("card_count"))
+        if card_count < 1:
+            errors.append(f"{label}: requirements.hardware.card_count must be >= 1")
+    except (TypeError, ValueError):
+        errors.append(f"{label}: requirements.hardware.card_count must be an integer")
+    allow_parallel = hardware.get("allow_parallel_on_host")
+    if not isinstance(allow_parallel, bool):
+        errors.append(f"{label}: requirements.hardware.allow_parallel_on_host must be boolean")
+
+    docker = docker_config(case)
+    if docker.get("enabled") is not True:
+        errors.append(f"{label}: runtime.docker.enabled must be true for Jenkins runtime execution")
+    if docker.get("network") != "host":
+        errors.append(f"{label}: runtime.docker.network must be host in the MVP runner")
+    mounts = docker.get("mounts")
+    if not isinstance(mounts, list) or not mounts:
+        errors.append(f"{label}: runtime.docker.mounts must be a non-empty list")
+    elif any(not isinstance(mount, dict) for mount in mounts):
+        errors.append(f"{label}: each runtime.docker.mounts entry must be a mapping")
 
     services = case.get("services")
     if not isinstance(services, list) or not services:

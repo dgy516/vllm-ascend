@@ -3,10 +3,10 @@ kind: DeployCase
 
 metadata:
   name: qwen25-05b-smoke
-  title: Qwen2.5 0.5B Single-Card Smoke Deployment
+  title: Qwen2.5 0.5B TP2 Smoke Deployment
   level: smoke
   owner: vllm-ascend-ci
-  description: Minimal single-service vLLM Ascend smoke case for Jenkins validation.
+  description: Minimal two-card single-service vLLM Ascend smoke case for Jenkins card-level concurrency validation.
   tags:
     - smoke
     - single-service
@@ -21,7 +21,10 @@ doc:
 requirements:
   hardware:
     accelerator: Ascend NPU
-    min_cards: 1
+    soc: any
+    min_cards: 2
+    card_count: 2
+    allow_parallel_on_host: true
     memory: "16 GB or higher recommended"
   software:
     python: ">=3.10"
@@ -37,6 +40,19 @@ runtime:
   workdir: "."
   env:
     VLLM_USE_MODELSCOPE: "true"
+  docker:
+    enabled: true
+    image: "${ASCEND_DOCKER_IMAGE}"
+    network: host
+    ipc: host
+    shm_size: 64g
+    mounts:
+      - source: "${WORKSPACE}"
+        target: /workspace/vllm-ascend
+        mode: rw
+      - source: "${MODEL_ROOT}"
+        target: "${MODEL_ROOT}"
+        mode: ro
 
 services:
   - name: qwen25-smoke
@@ -56,6 +72,8 @@ services:
         - 127.0.0.1
         - --port
         - "8000"
+        - --tensor-parallel-size
+        - "2"
         - --max-model-len
         - "2048"
         - --max-num-batched-tokens

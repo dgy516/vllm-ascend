@@ -22,7 +22,10 @@ doc:
 requirements:
   hardware:
     accelerator: Ascend 910B or compatible
+    soc: any
     min_cards: 8
+    card_count: 8
+    allow_parallel_on_host: true
     memory: "64 GB per card recommended"
   software:
     python: ">=3.10"
@@ -41,6 +44,19 @@ runtime:
     TASK_QUEUE_ENABLE: "1"
     OMP_PROC_BIND: "false"
     HCCL_OP_EXPANSION_MODE: AIV
+  docker:
+    enabled: true
+    image: "${ASCEND_DOCKER_IMAGE}"
+    network: host
+    ipc: host
+    shm_size: 128g
+    mounts:
+      - source: "${WORKSPACE}"
+        target: /workspace/vllm-ascend
+        mode: rw
+      - source: "${MODEL_ROOT}"
+        target: "${MODEL_ROOT}"
+        mode: ro
 
 services:
   - name: qwen3-32b

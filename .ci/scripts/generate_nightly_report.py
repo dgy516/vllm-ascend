@@ -73,6 +73,10 @@ def _case_rows(results: list[dict[str, Any]]) -> str:
             f"<td class=\"{status}\">{status}</td>"
             f"<td>{html.escape(str(item.get('failure_stage') or ''))}</td>"
             f"<td>{html.escape(str(item.get('failure_reason') or ''))}</td>"
+            f"<td>{html.escape(','.join(str(x) for x in item.get('allocated_cards') or []))}</td>"
+            f"<td>{html.escape(','.join(str(x) for x in item.get('allocated_ports') or []))}</td>"
+            f"<td>{html.escape(str(item.get('container_name') or ''))}</td>"
+            f"<td>{html.escape(str(item.get('host_node') or ''))}</td>"
             f"<td>{html.escape(str((item.get('artifacts') or {}).get('server_log', '')))}</td>"
             "</tr>"
         )
@@ -131,6 +135,10 @@ def main() -> int:
             "status": item.get("status", ""),
             "failure_stage": item.get("failure_stage") or "",
             "failure_reason": item.get("failure_reason") or "",
+            "allocated_cards": ",".join(str(x) for x in item.get("allocated_cards") or []),
+            "allocated_ports": ",".join(str(x) for x in item.get("allocated_ports") or []),
+            "container_name": item.get("container_name") or "",
+            "host_node": item.get("host_node") or "",
             "server_log": (item.get("artifacts") or {}).get("server_log", ""),
         }
         for item in results
@@ -138,7 +146,18 @@ def main() -> int:
     _write_csv(
         out_dir / "cases.csv",
         case_rows,
-        ["case_name", "level", "status", "failure_stage", "failure_reason", "server_log"],
+        [
+            "case_name",
+            "level",
+            "status",
+            "failure_stage",
+            "failure_reason",
+            "allocated_cards",
+            "allocated_ports",
+            "container_name",
+            "host_node",
+            "server_log",
+        ],
     )
     _write_csv(
         out_dir / "benchmark.csv",

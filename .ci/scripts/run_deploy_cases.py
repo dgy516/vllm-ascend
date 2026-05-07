@@ -19,6 +19,9 @@ from deploy_case_lib import (
     STATUS_FAILED,
     STATUS_PASSED,
     STATUS_SKIPPED,
+    allocation_cards,
+    allocation_ports,
+    apply_allocation,
     build_vllm_serve_command,
     case_level,
     case_name,
@@ -27,7 +30,9 @@ from deploy_case_lib import (
     first_service,
     load_case,
     read_case_list,
+    read_json,
     safe_slug,
+    set_cli_flag_value,
     stage_result,
     write_json,
 )
@@ -39,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="reports/nightly/case_results", help="Per-case JSON output directory")
     parser.add_argument("--logs-dir", default="logs/deploy", help="Runtime log directory")
     parser.add_argument("--model-root", default="", help="Optional local model root for env expansion")
+    parser.add_argument(
+        "--allocation-json",
+        default="",
+        help="Optional allocation JSON from with_runtime_allocation.py",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Render commands and results without launching vLLM")
     parser.add_argument("--run-benchmark", action="store_true", help="Run tests.benchmark when enabled")
     parser.add_argument("--run-accuracy", action="store_true", help="Run tests.accuracy when enabled")
@@ -46,13 +56,45 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _result_skeleton(case: dict[str, Any]) -> dict[str, Any]:
+def _load_allocation(path: str) -> dict[str, Any] | None:
+    if not path:
+        return None
+    allocation_path = Path(path)
+    if not allocation_path.exists():
+        raise FileNotFoundError(f"allocation JSON does not exist: {allocation_path}")
+    payload = read_json(allocation_path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"allocation JSON must contain an object: {allocation_path}")
+    return payload
+
+
+def _env_int_list(value: str) -> list[int]:
+    result: list[int] = []
+    for item in value.split(","):
+        stripped = item.strip()
+        if not stripped:
+            continue
+        result.append(int(stripped))
+    return result
+
+
+def _result_skeleton(case: dict[str, Any], allocation: dict[str, Any] | None = None) -> dict[str, Any]:
+    cards = allocation_cards(allocation)
+    ports = allocation_ports(allocation)
+    if not cards and os.getenv("ASCEND_RT_VISIBLE_DEVICES"):
+        cards = _env_int_list(os.environ["ASCEND_RT_VISIBLE_DEVICES"])
+    if not ports and os.getenv("VLLM_CI_ALLOCATED_PORTS"):
+        ports = _env_int_list(os.environ["VLLM_CI_ALLOCATED_PORTS"])
     return {
         "case_name": case_name(case),
         "level": case_level(case),
         "status": STATUS_PASSED,
         "failure_stage": None,
         "failure_reason": None,
+        "allocated_cards": cards,
+        "allocated_ports": ports,
+        "container_name": os.getenv("VLLM_CI_CONTAINER_NAME") or os.getenv("HOSTNAME") or None,
+        "host_node": (allocation or {}).get("host_node") or os.getenv("NODE_NAME") or None,
         "startup": stage_result(STATUS_SKIPPED),
         "readiness": stage_result(STATUS_SKIPPED),
         "smoke": stage_result(STATUS_SKIPPED),
@@ -80,7 +122,13 @@ def _case_env(case: dict[str, Any], model_root: str) -> dict[str, str]:
 def _log_path(case: dict[str, Any], service: dict[str, Any], logs_dir: Path) -> Path:
     configured = service.get("log_file")
     if configured:
-        return Path(str(configured))
+        configured_path = Path(str(configured))
+        if configured_path.is_absolute():
+            return configured_path
+        try:
+            return logs_dir / configured_path.relative_to("logs/deploy")
+        except ValueError:
+            return configured_path
     return logs_dir / safe_slug(case_name(case)) / "server.log"
 
 
@@ -201,12 +249,16 @@ def _terminate_process(process: subprocess.Popen[Any] | None) -> None:
 
 def _run_one_case(case_path: str, args: argparse.Namespace) -> dict[str, Any]:
     case = load_case(case_path)
-    result = _result_skeleton(case)
+    allocation = _load_allocation(args.allocation_json)
+    apply_allocation(case, allocation)
+    result = _result_skeleton(case, allocation)
     service = first_service(case)
     output_dir = Path(args.output_dir)
     logs_dir = Path(args.logs_dir)
     log_path = _log_path(case, service, logs_dir)
     result["artifacts"]["server_log"] = str(log_path)
+    if args.allocation_json:
+        result["artifacts"]["allocation_json"] = args.allocation_json
     process: subprocess.Popen[Any] | None = None
 
     try:
@@ -273,6 +325,8 @@ def _run_one_case(case_path: str, args: argparse.Namespace) -> dict[str, Any]:
         if benchmark.get("enabled") and args.run_benchmark:
             command = [str(item) for item in benchmark.get("command") or []]
             if command:
+                set_cli_flag_value(command, "--host", host)
+                set_cli_flag_value(command, "--port", port)
                 result["benchmark"] = _run_command(
                     command,
                     env,

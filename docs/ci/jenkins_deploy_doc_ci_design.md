@@ -252,14 +252,11 @@ cpu
 docker-builder
   用于构建 CI 镜像
 
-ascend 1card
-  单卡 Ascend smoke 节点
+ascend a2
+  A2 8 卡 Ascend 节点，可配置多个 Jenkins executor
 
-ascend 8card
-  单机 8 卡 Ascend 节点
-
-ascend a3 8card
-  A3 单机 8 卡节点
+ascend a3
+  A3 16 卡 Ascend 节点，可配置更多 Jenkins executor
 
 ascend multinode
   多机 Ascend 节点，用于 PD 分离、多机多卡
@@ -270,13 +267,25 @@ Jenkinsfile 中通过参数指定：
 ```text
 CPU_LABEL=cpu
 DOCKER_BUILDER_LABEL=docker-builder
-ASCEND_LABEL=ascend && 8card
-ASCEND_LOCK_LABEL=ascend-8card
+ASCEND_LABEL=ascend
+ASCEND_A2_LABEL=ascend && a2
+ASCEND_A3_LABEL=ascend && a3
+ASCEND_LOCK_LABEL=
 ```
 
 ### 6.1 资源锁
 
-Ascend 资源必须独占，尤其是：
+第一版采用“卡级 file lock + Docker 容器隔离”作为默认资源模型：
+
+1. 一个 Jenkins parallel branch 对应一个 Docker 容器。
+2. `.ci/scripts/with_runtime_allocation.py` 在宿主机用 file lock 分配 `requirements.hardware.card_count` 张卡和服务端口。
+3. 容器通过 `ASCEND_RT_VISIBLE_DEVICES` 只看到分配到的卡。
+4. `VLLM_CI_ALLOCATED_PORTS` 和 allocation JSON 用于覆盖 DeployCase 中的固定端口，避免同机并发端口冲突。
+5. A2 8 卡机器可并发多个 2 卡 case，A3 16 卡机器可并发更多 2 卡 case；8/16 卡大模型 case 会按需占用更多卡。
+
+`ASCEND_LOCK_LABEL` 保留为可选外层保护。默认应为空，否则同一 lock label 会把 parallel branch 串行化。
+
+仍建议对以下场景使用 Jenkins Lockable Resources Plugin 做外层保护：
 
 1. benchmark
     
@@ -294,10 +303,35 @@ Ascend 资源必须独占，尤其是：
 示例：
 
 ```groovy
-lock(label: 'ascend-8card', quantity: 1) {
-    sh 'python3 .ci/scripts/run_deploy_cases.py ...'
+lock(label: 'ascend-maintenance', quantity: 1) {
+    sh 'python3 .ci/scripts/with_runtime_allocation.py ... -- docker run ...'
 }
 ```
+
+### 6.2 Docker 卡级并发
+
+Docker runtime 由 Jenkinsfile 在 Ascend agent 上启动，仓库不硬编码 Ascend 设备参数。设备透传通过 `ASCEND_DOCKER_DEVICE_ARGS` 注入，例如 `--device`、`--privileged` 或站点自定义 driver mount。
+
+容器启动约定：
+
+```bash
+docker run --rm \
+  --name vllm-ascend-ci-${BUILD_TAG}-${CASE_NAME} \
+  --network host \
+  --ipc host \
+  --shm-size ${SHM_SIZE} \
+  ${ASCEND_DOCKER_DEVICE_ARGS} \
+  -e ASCEND_RT_VISIBLE_DEVICES=${ALLOCATED_CARDS} \
+  -e VLLM_CI_ALLOCATED_PORTS=${ALLOCATED_PORTS} \
+  -e MODEL_ROOT=${MODEL_ROOT} \
+  -v ${WORKSPACE}:/workspace/vllm-ascend:rw \
+  -v ${MODEL_ROOT}:${MODEL_ROOT}:ro \
+  -w /workspace/vllm-ascend \
+  ${ASCEND_DOCKER_IMAGE} \
+  python3 .ci/scripts/run_deploy_cases.py ...
+```
+
+`DRY_RUN_RUNTIME=true` 时 Jenkins 仍会规划 shard、执行分配 dry-run、生成 per-case dry-run 结果并打印 Docker 命令，但不会启动真实容器或模型。
 
 ---
 
@@ -1637,7 +1671,15 @@ nightly 生成完整报告
 | `RUN_BENCHMARK` | `false` by default | 只在 benchmark/nightly 节点上开启 |
 | `MODEL_ROOT` | Jenkins agent 本地模型根目录 | 可为空，或用于本地模型镜像 |
 | `ASCEND_LABEL` | Ascend agent label | 例如 `ascend && 8card` |
-| `ASCEND_LOCK_LABEL` | Lockable Resources label | 为空时跳过锁 |
+| `ASCEND_A2_LABEL` | A2 Ascend agent label | 例如 `ascend && a2` |
+| `ASCEND_A3_LABEL` | A3 Ascend agent label | 例如 `ascend && a3` |
+| `ASCEND_LOCK_LABEL` | Lockable Resources label | 默认留空；只做可选外层保护 |
+| `ASCEND_DOCKER_IMAGE` | Ascend runtime Docker image | 为空时使用 `REGISTRY/IMAGE_TAG` 推导 |
+| `ASCEND_DOCKER_DEVICE_ARGS` | Docker device flags | 由 Jenkins 站点注入，不写入仓库 |
+| `NPU_LOCK_DIR` | 卡级 file lock 目录 | 默认 `/tmp/vllm-ascend-ci/npu` |
+| `PORT_LOCK_DIR` | 端口 file lock 目录 | 默认 `/tmp/vllm-ascend-ci/ports` |
+| `RUNTIME_PARALLELISM` | runtime shard 并发上限 | `0` 表示全部 shard 并发 |
+| `DRY_RUN_RUNTIME` | Docker runtime dry-run | 默认 `true`，验证命令但不启动模型 |
 
 ### 本地静态验证
 
@@ -1646,6 +1688,9 @@ python3 .ci/scripts/validate_deploy_case.py --cases ".ci/deploy_cases/*.yaml" --
 python3 .ci/scripts/select_deploy_cases.py --cases ".ci/deploy_cases/*.yaml" --level smoke --output reports/selected_cases.txt
 python3 .ci/scripts/render_deploy_docs.py --cases ".ci/deploy_cases/*.yaml" --level smoke --output-dir docs/deploy/generated
 python3 .ci/scripts/static_validate_cases.py --case-list reports/selected_cases.txt --output reports/static_validate.json
+python3 .ci/scripts/plan_deploy_shards.py --case-list reports/selected_cases.txt --output reports/runtime_shards.json
+python3 .ci/scripts/with_runtime_allocation.py --dry-run --card-count 2 --port-count 1 --output reports/test_allocation.json
+python3 .ci/scripts/run_deploy_cases.py --case-list reports/selected_cases.txt --allocation-json reports/test_allocation.json --dry-run --continue-on-error
 python3 .ci/scripts/generate_junit_report.py --input reports/nightly/case_results --output reports/nightly/junit.xml
 python3 .ci/scripts/generate_nightly_report.py --input reports/nightly/case_results --output reports/nightly/index.html
 ```

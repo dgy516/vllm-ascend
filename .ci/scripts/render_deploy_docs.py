@@ -13,9 +13,11 @@ import yaml
 from deploy_case_lib import (
     ALLOWED_LEVELS,
     build_vllm_serve_command,
+    case_card_count,
     case_level,
     case_name,
     command_to_shell,
+    docker_config,
     expand_case_paths,
     first_service,
     load_case,
@@ -40,7 +42,14 @@ def _format_mapping(value: Any) -> str:
                 for sub_key, sub_value in item.items():
                     lines.append(f"  - `{sub_key}`: {sub_value}")
             elif isinstance(item, list):
-                lines.append(f"- `{key}`: {', '.join(str(x) for x in item)}")
+                lines.append(f"- `{key}`:")
+                for index, entry in enumerate(item, start=1):
+                    if isinstance(entry, dict):
+                        lines.append(f"  - item {index}:")
+                        for sub_key, sub_value in entry.items():
+                            lines.append(f"    - `{sub_key}`: {sub_value}")
+                    else:
+                        lines.append(f"  - {entry}")
             else:
                 lines.append(f"- `{key}`: {item}")
         return "\n".join(lines) if lines else "- N/A"
@@ -69,6 +78,18 @@ def _parameter_table(args: list[str]) -> str:
     return "\n".join(rows)
 
 
+def _docker_mounts(mounts: list[dict[str, Any]]) -> str:
+    if not mounts:
+        return "# no explicit mounts"
+    lines: list[str] = []
+    for mount in mounts:
+        source = mount.get("source", "")
+        target = mount.get("target", "")
+        mode = mount.get("mode", "rw")
+        lines.append(f"-v {source}:{target}:{mode}")
+    return " \\\n  ".join(lines)
+
+
 def _render_template(template_text: str, context: dict[str, str]) -> str:
     try:
         from jinja2 import Template
@@ -87,6 +108,7 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
     doc = case.get("doc", {})
     requirements = case.get("requirements", {})
     runtime = case.get("runtime", {})
+    docker = docker_config(case)
     service = first_service(case)
     vllm = service.get("vllm") or {}
     command = build_vllm_serve_command(case, service)
@@ -113,6 +135,21 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
         f"- Service `{service.get('name')}` runs as `{service.get('type')}` on "
         f"`{host}:{port}` with role `{service.get('role')}`."
     )
+    docker_command = (
+        "docker run --rm \\\n"
+        f"  --name vllm-ascend-ci-{case_name(case)} \\\n"
+        f"  --network {docker.get('network', 'host')} \\\n"
+        f"  --ipc {docker.get('ipc', 'host')} \\\n"
+        f"  --shm-size {docker.get('shm_size', '64g')} \\\n"
+        "  ${ASCEND_DOCKER_DEVICE_ARGS} \\\n"
+        "  -e ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES} \\\n"
+        "  -e VLLM_CI_ALLOCATED_PORTS=${VLLM_CI_ALLOCATED_PORTS} \\\n"
+        "  -e MODEL_ROOT=${MODEL_ROOT} \\\n"
+        f"  {_docker_mounts(docker.get('mounts') or [])} \\\n"
+        "  -w /workspace/vllm-ascend \\\n"
+        f"  {docker.get('image', '${ASCEND_DOCKER_IMAGE}')} \\\n"
+        f"  {serve_shell}"
+    )
 
     return {
         "generated_warning": str(doc.get("generated_warning", "")),
@@ -125,9 +162,12 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
         "difficulty": str(doc.get("difficulty", "")),
         "tags": ", ".join(str(tag) for tag in metadata.get("tags", [])),
         "hardware": _format_mapping(requirements.get("hardware", {})),
+        "card_count": str(case_card_count(case)),
         "software": _format_mapping(requirements.get("software", {})),
         "model_requirements": _format_mapping(requirements.get("model", {})),
         "topology": topology,
+        "docker_runtime": _format_mapping(docker),
+        "docker_command": docker_command,
         "env_exports": _env_exports(runtime.get("env") or {}),
         "serve_command": serve_shell,
         "vllm_config": yaml.safe_dump(vllm, allow_unicode=True, sort_keys=False).rstrip(),

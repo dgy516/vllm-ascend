@@ -3,10 +3,10 @@ kind: DeployCase
 
 metadata:
   name: qwen25-05b-static
-  title: Qwen2.5 0.5B Static DeployCase Contract Check
+  title: Qwen2.5 0.5B TP2 Static DeployCase Contract Check
   level: static
   owner: vllm-ascend-ci
-  description: Static Jenkins case used by PR/static flows to validate DeployCase rendering and CLI generation.
+  description: Static Jenkins case used by PR/static flows to validate DeployCase rendering, Docker metadata, and CLI generation.
   tags:
     - static
     - single-service
@@ -21,7 +21,10 @@ doc:
 requirements:
   hardware:
     accelerator: Ascend NPU
-    min_cards: 1
+    soc: any
+    min_cards: 2
+    card_count: 2
+    allow_parallel_on_host: true
     memory: "16 GB or higher recommended"
   software:
     python: ">=3.10"
@@ -37,6 +40,19 @@ runtime:
   workdir: "."
   env:
     VLLM_USE_MODELSCOPE: "true"
+  docker:
+    enabled: true
+    image: "${ASCEND_DOCKER_IMAGE}"
+    network: host
+    ipc: host
+    shm_size: 64g
+    mounts:
+      - source: "${WORKSPACE}"
+        target: /workspace/vllm-ascend
+        mode: rw
+      - source: "${MODEL_ROOT}"
+        target: "${MODEL_ROOT}"
+        mode: ro
 
 services:
   - name: qwen25-static
@@ -56,6 +72,8 @@ services:
         - 127.0.0.1
         - --port
         - "8001"
+        - --tensor-parallel-size
+        - "2"
         - --max-model-len
         - "2048"
         - --max-num-batched-tokens

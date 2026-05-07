@@ -1,10 +1,10 @@
 本文档由 .ci/deploy_cases/*.yaml 自动生成，请不要直接手工修改。
 
-# Qwen2.5 0.5B Single-Card Smoke Deployment
+# Qwen2.5 0.5B TP2 Smoke Deployment
 
 ## 1. 文档概述
 
-Minimal single-service vLLM Ascend smoke case for Jenkins validation.
+Minimal two-card single-service vLLM Ascend smoke case for Jenkins card-level concurrency validation.
 
 - Case: `qwen25-05b-smoke`
 - Level: `smoke`
@@ -18,7 +18,10 @@ Minimal single-service vLLM Ascend smoke case for Jenkins validation.
 ### Hardware
 
 - `accelerator`: Ascend NPU
-- `min_cards`: 1
+- `soc`: any
+- `min_cards`: 2
+- `card_count`: 2
+- `allow_parallel_on_host`: True
 - `memory`: 16 GB or higher recommended
 
 ### Software
@@ -37,6 +40,8 @@ Minimal single-service vLLM Ascend smoke case for Jenkins validation.
 
 - Service `qwen25-smoke` runs as `vllm-serve` on `127.0.0.1:8000` with role `serve`.
 
+本 case 在 Jenkins runtime 中申请 `2` 张 Ascend 卡。卡号和端口由 `.ci/scripts/with_runtime_allocation.py` 在宿主机分配，并通过 `ASCEND_RT_VISIBLE_DEVICES` 和 `VLLM_CI_ALLOCATED_PORTS` 注入容器。
+
 ## 5. 环境变量
 
 ```bash
@@ -45,9 +50,47 @@ export VLLM_USE_MODELSCOPE=true
 
 ## 6. 启动服务命令
 
+### vLLM 命令
+
 ```bash
-vllm serve Qwen/Qwen2.5-0.5B-Instruct --served-model-name qwen25-05b-smoke --host 127.0.0.1 --port 8000 --max-model-len 2048 --max-num-batched-tokens 2048 --trust-remote-code
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --served-model-name qwen25-05b-smoke --host 127.0.0.1 --port 8000 --tensor-parallel-size 2 --max-model-len 2048 --max-num-batched-tokens 2048 --trust-remote-code
 ```
+
+### Docker runtime 示例
+
+```bash
+docker run --rm \
+  --name vllm-ascend-ci-qwen25-05b-smoke \
+  --network host \
+  --ipc host \
+  --shm-size 64g \
+  ${ASCEND_DOCKER_DEVICE_ARGS} \
+  -e ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES} \
+  -e VLLM_CI_ALLOCATED_PORTS=${VLLM_CI_ALLOCATED_PORTS} \
+  -e MODEL_ROOT=${MODEL_ROOT} \
+  -v ${WORKSPACE}:/workspace/vllm-ascend:rw \
+  -v ${MODEL_ROOT}:${MODEL_ROOT}:ro \
+  -w /workspace/vllm-ascend \
+  ${ASCEND_DOCKER_IMAGE} \
+  vllm serve Qwen/Qwen2.5-0.5B-Instruct --served-model-name qwen25-05b-smoke --host 127.0.0.1 --port 8000 --tensor-parallel-size 2 --max-model-len 2048 --max-num-batched-tokens 2048 --trust-remote-code
+```
+
+Docker 配置：
+
+- `enabled`: True
+- `image`: ${ASCEND_DOCKER_IMAGE}
+- `network`: host
+- `ipc`: host
+- `shm_size`: 64g
+- `mounts`:
+  - item 1:
+    - `source`: ${WORKSPACE}
+    - `target`: /workspace/vllm-ascend
+    - `mode`: rw
+  - item 2:
+    - `source`: ${MODEL_ROOT}
+    - `target`: ${MODEL_ROOT}
+    - `mode`: ro
 
 ## 7. vLLM config 示例
 
@@ -62,6 +105,8 @@ args:
 - 127.0.0.1
 - --port
 - '8000'
+- --tensor-parallel-size
+- '2'
 - --max-model-len
 - '2048'
 - --max-num-batched-tokens
@@ -105,6 +150,7 @@ curl -sS -X POST http://127.0.0.1:8000/v1/completions \
 | `--served-model-name` | `qwen25-05b-smoke` |
 | `--host` | `127.0.0.1` |
 | `--port` | `8000` |
+| `--tensor-parallel-size` | `2` |
 | `--max-model-len` | `2048` |
 | `--max-num-batched-tokens` | `2048` |
 | `--trust-remote-code` | enabled |
@@ -118,6 +164,7 @@ pkill -f 'vllm serve Qwen/Qwen2.5-0.5B-Instruct' || true
 ## 13. 注意事项
 
 - Jenkins 默认 `RUN_ASCEND=false`，不会在静态流程中启动真实模型。
-- 大模型 case 需要独占 Ascend 资源，建议配置 `ASCEND_LOCK_LABEL`。
+- 一个 Jenkins parallel branch 对应一个 Docker 容器，容器只看到分配到的 Ascend 卡。
+- 大模型 case 会按 `requirements.hardware.card_count` 申请更多卡；`ASCEND_LOCK_LABEL` 只作为可选外层保护。
 - `reports/` 和 `logs/` 是运行时产物目录，不应提交到 Git。
 - PD、多服务和多机场景在第一版中只预留结构，runner 暂不执行。
