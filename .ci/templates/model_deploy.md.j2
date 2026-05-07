@@ -1,0 +1,89 @@
+{{ generated_warning }}
+
+# {{ title }}
+
+## 1. 文档概述
+
+{{ description }}
+
+- Case: `{{ name }}`
+- Level: `{{ level }}`
+- Owner: `{{ owner }}`
+- Audience: {{ audience }}
+- Difficulty: {{ difficulty }}
+- Tags: {{ tags }}
+
+## 2. 环境要求
+
+### Hardware
+
+{{ hardware }}
+
+### Software
+
+{{ software }}
+
+## 3. 模型信息
+
+{{ model_requirements }}
+
+## 4. 部署拓扑
+
+{{ topology }}
+
+## 5. 环境变量
+
+```bash
+{{ env_exports }}
+```
+
+## 6. 启动服务命令
+
+```bash
+{{ serve_command }}
+```
+
+## 7. vLLM config 示例
+
+```yaml
+{{ vllm_config }}
+```
+
+## 8. 服务验证
+
+```bash
+{{ readiness_command }}
+```
+
+```bash
+{{ smoke_command }}
+```
+
+## 9. Benchmark 验证
+
+```bash
+{{ benchmark_command }}
+```
+
+## 10. Accuracy 验证
+
+```bash
+{{ accuracy_command }}
+```
+
+## 11. 参数说明
+
+{{ parameter_table }}
+
+## 12. 停止服务
+
+```bash
+{{ stop_command }}
+```
+
+## 13. 注意事项
+
+- Jenkins 默认 `RUN_ASCEND=false`，不会在静态流程中启动真实模型。
+- 大模型 case 需要独占 Ascend 资源，建议配置 `ASCEND_LOCK_LABEL`。
+- `reports/` 和 `logs/` 是运行时产物目录，不应提交到 Git。
+- PD、多服务和多机场景在第一版中只预留结构，runner 暂不执行。

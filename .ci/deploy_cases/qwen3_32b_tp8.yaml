@@ -1,0 +1,125 @@
+apiVersion: llm-ci/v1
+kind: DeployCase
+
+metadata:
+  name: qwen3-32b-tp8
+  title: Qwen3 32B TP8 Nightly Deployment
+  level: nightly
+  owner: vllm-ascend-ci
+  description: Single-service Qwen3 32B deployment case for 8-card Ascend nightly validation.
+  tags:
+    - nightly
+    - single-service
+    - qwen3
+    - tp8
+
+doc:
+  output: docs/deploy/generated/qwen3_32b_tp8.md
+  audience: vLLM Ascend deployment engineers
+  difficulty: advanced
+  generated_warning: "本文档由 .ci/deploy_cases/*.yaml 自动生成，请不要直接手工修改。"
+
+requirements:
+  hardware:
+    accelerator: Ascend 910B or compatible
+    min_cards: 8
+    memory: "64 GB per card recommended"
+  software:
+    python: ">=3.10"
+    cann: "Compatible with the checked-out vLLM Ascend branch"
+    vllm_ascend: "Installed from this repository"
+  model:
+    name: Qwen/Qwen3-32B
+    source: Hugging Face or ModelScope
+    path_hint: "Use MODEL_ROOT or a pre-populated model cache on Jenkins agents."
+
+runtime:
+  image: "${REGISTRY}/vllm-ascend-ci:${IMAGE_TAG}"
+  workdir: "."
+  env:
+    VLLM_USE_MODELSCOPE: "true"
+    TASK_QUEUE_ENABLE: "1"
+    OMP_PROC_BIND: "false"
+    HCCL_OP_EXPANSION_MODE: AIV
+
+services:
+  - name: qwen3-32b
+    role: serve
+    type: vllm-serve
+    host: 127.0.0.1
+    port: 8113
+    log_file: logs/deploy/qwen3-32b-tp8/server.log
+    vllm:
+      model: Qwen/Qwen3-32B
+      local_model_path: ${MODEL_ROOT}/Qwen3-32B
+      served_model_name: qwen3-32b-tp8
+      args:
+        - --served-model-name
+        - qwen3-32b-tp8
+        - --host
+        - 127.0.0.1
+        - --port
+        - "8113"
+        - --tensor-parallel-size
+        - "8"
+        - --max-model-len
+        - "32768"
+        - --max-num-batched-tokens
+        - "32768"
+        - --max-num-seqs
+        - "16"
+        - --gpu-memory-utilization
+        - "0.9"
+        - --trust-remote-code
+        - --no-enable-prefix-caching
+
+checks:
+  readiness:
+    path: /health
+    timeout_sec: 1800
+    interval_sec: 10
+
+tests:
+  smoke:
+    enabled: true
+    endpoint: /v1/completions
+    method: POST
+    expected_http_status: 200
+    payload:
+      model: qwen3-32b-tp8
+      prompt: "The future of AI is"
+      max_tokens: 16
+      temperature: 0
+  benchmark:
+    enabled: false
+    command:
+      - vllm
+      - bench
+      - serve
+      - --model
+      - qwen3-32b-tp8
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8113"
+      - --dataset-name
+      - random
+      - --random-input
+      - "200"
+      - --num-prompts
+      - "200"
+      - --request-rate
+      - "1"
+      - --save-result
+      - --result-dir
+      - reports/nightly/benchmark
+    thresholds:
+      max_failed_requests: 0
+      max_ttft_regression_pct: 10
+      max_tpot_regression_pct: 10
+      max_itl_regression_pct: 10
+      max_throughput_drop_pct: 10
+  accuracy:
+    enabled: false
+    mode: execute_only
+    command: []

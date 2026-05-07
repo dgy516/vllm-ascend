@@ -1,0 +1,94 @@
+apiVersion: llm-ci/v1
+kind: DeployCase
+
+metadata:
+  name: qwen25-05b-smoke
+  title: Qwen2.5 0.5B Single-Card Smoke Deployment
+  level: smoke
+  owner: vllm-ascend-ci
+  description: Minimal single-service vLLM Ascend smoke case for Jenkins validation.
+  tags:
+    - smoke
+    - single-service
+    - qwen
+
+doc:
+  output: docs/deploy/generated/qwen25_05b_smoke.md
+  audience: CI maintainers and deployment engineers
+  difficulty: basic
+  generated_warning: "本文档由 .ci/deploy_cases/*.yaml 自动生成，请不要直接手工修改。"
+
+requirements:
+  hardware:
+    accelerator: Ascend NPU
+    min_cards: 1
+    memory: "16 GB or higher recommended"
+  software:
+    python: ">=3.10"
+    cann: "Compatible with the checked-out vLLM Ascend branch"
+    vllm_ascend: "Installed from this repository"
+  model:
+    name: Qwen/Qwen2.5-0.5B-Instruct
+    source: Hugging Face or ModelScope
+    path_hint: "Set MODEL_ROOT only when using a local mirror."
+
+runtime:
+  image: "${REGISTRY}/vllm-ascend-ci:${IMAGE_TAG}"
+  workdir: "."
+  env:
+    VLLM_USE_MODELSCOPE: "true"
+
+services:
+  - name: qwen25-smoke
+    role: serve
+    type: vllm-serve
+    host: 127.0.0.1
+    port: 8000
+    log_file: logs/deploy/qwen25-05b-smoke/server.log
+    vllm:
+      model: Qwen/Qwen2.5-0.5B-Instruct
+      local_model_path: ${MODEL_ROOT}/Qwen2.5-0.5B-Instruct
+      served_model_name: qwen25-05b-smoke
+      args:
+        - --served-model-name
+        - qwen25-05b-smoke
+        - --host
+        - 127.0.0.1
+        - --port
+        - "8000"
+        - --max-model-len
+        - "2048"
+        - --max-num-batched-tokens
+        - "2048"
+        - --trust-remote-code
+
+checks:
+  readiness:
+    path: /health
+    timeout_sec: 600
+    interval_sec: 5
+
+tests:
+  smoke:
+    enabled: true
+    endpoint: /v1/completions
+    method: POST
+    expected_http_status: 200
+    payload:
+      model: qwen25-05b-smoke
+      prompt: "San Francisco is a"
+      max_tokens: 8
+      temperature: 0
+  benchmark:
+    enabled: false
+    command: []
+    thresholds:
+      max_failed_requests: 0
+      max_ttft_regression_pct: 10
+      max_tpot_regression_pct: 10
+      max_itl_regression_pct: 10
+      max_throughput_drop_pct: 10
+  accuracy:
+    enabled: false
+    mode: execute_only
+    command: []
