@@ -38,21 +38,29 @@ requirements:
 
 runtime:
   image: "${REGISTRY}/vllm-ascend-ci:${IMAGE_TAG}"
-  workdir: "."
+  workdir: /home/ma-user/AscendCloud/jenkins
   env:
     VLLM_USE_MODELSCOPE: "true"
+    PYTORCH_NPU_ALLOC_CONF: max_split_size_mb:256
     TASK_QUEUE_ENABLE: "1"
     OMP_PROC_BIND: "false"
     HCCL_OP_EXPANSION_MODE: AIV
   docker:
     enabled: true
     image: "${ASCEND_DOCKER_IMAGE}"
+    workspace: /home/ma-user/AscendCloud/jenkins
     network: host
     ipc: host
-    shm_size: 128g
+    shm_size: 1g
     mounts:
-      - source: "${WORKSPACE}"
-        target: /workspace/vllm-ascend
+      - source: "${WORKSPACE}/.ci"
+        target: /home/ma-user/AscendCloud/jenkins/.ci
+        mode: ro
+      - source: "${WORKSPACE}/reports"
+        target: /home/ma-user/AscendCloud/jenkins/reports
+        mode: rw
+      - source: "${WORKSPACE}/logs"
+        target: /home/ma-user/AscendCloud/jenkins/logs
         mode: rw
       - source: "${MODEL_ROOT}"
         target: "${MODEL_ROOT}"

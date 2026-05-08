@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan DeployCase runtime shards for Jenkins parallel branches."""
+"""Plan DeployCase runtime metadata for one Jenkins runtime container."""
 
 from __future__ import annotations
 
@@ -22,13 +22,13 @@ from deploy_case_lib import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plan one DeployCase per Jenkins runtime shard.")
+    parser = argparse.ArgumentParser(description="Plan DeployCase metadata for one Jenkins runtime container.")
     parser.add_argument("--case-list", required=True, help="Path produced by select_deploy_cases.py")
-    parser.add_argument("--output", default="reports/runtime_shards.json", help="Shard plan JSON path")
+    parser.add_argument("--output", default="reports/runtime_shards.json", help="Runtime plan JSON path")
     parser.add_argument(
         "--shard-dir",
         default="reports/runtime_shards",
-        help="Directory for per-shard selected case list files",
+        help="Directory for compatibility per-case list files",
     )
     return parser.parse_args()
 
@@ -76,11 +76,19 @@ def main() -> int:
     payload = {
         "status": "passed",
         "total": len(shards),
+        "runtime_model": "single-container",
+        "container_card_count": 0,
+        "total_card_demand": sum(int(shard["card_count"]) for shard in shards),
+        "max_case_card_count": max((int(shard["card_count"]) for shard in shards), default=0),
+        "total_port_count": sum(int(shard["port_count"]) for shard in shards),
         "shard_dir": str(shard_dir),
         "shards": shards,
     }
     write_json(args.output, payload)
-    print(f"planned {len(shards)} runtime shard(s); output={args.output}")
+    print(
+        f"planned {len(shards)} case(s) for one runtime container; "
+        f"ports={payload['total_port_count']}; output={args.output}"
+    )
     if not shards:
         print("No runtime shards planned because the selected case list is empty.")
     return 0

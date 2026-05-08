@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import signal
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -23,6 +25,7 @@ from deploy_case_lib import (
     allocation_ports,
     apply_allocation,
     build_vllm_serve_command,
+    case_card_count,
     case_level,
     case_name,
     command_to_shell,
@@ -32,6 +35,7 @@ from deploy_case_lib import (
     read_case_list,
     read_json,
     safe_slug,
+    service_card_count,
     set_cli_flag_value,
     stage_result,
     write_json,
@@ -53,6 +57,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-benchmark", action="store_true", help="Run tests.benchmark when enabled")
     parser.add_argument("--run-accuracy", action="store_true", help="Run tests.accuracy when enabled")
     parser.add_argument("--continue-on-error", action="store_true", help="Continue after case failures")
+    parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=1,
+        help="Concurrent cases inside one runtime container; 0 means one worker per selected case",
+    )
+    parser.add_argument(
+        "--allocation-wait-sec",
+        type=int,
+        default=3600,
+        help="Seconds a case waits for cards/ports inside the runtime container",
+    )
     return parser.parse_args()
 
 
@@ -78,6 +94,68 @@ def _env_int_list(value: str) -> list[int]:
     return result
 
 
+def _allocation_from_env() -> dict[str, Any] | None:
+    cards = _env_int_list(os.getenv("ASCEND_RT_VISIBLE_DEVICES", ""))
+    ports = _env_int_list(os.getenv("VLLM_CI_ALLOCATED_PORTS", ""))
+    if not cards and not ports:
+        return None
+    return {
+        "cards": cards,
+        "ports": ports,
+        "host_node": os.getenv("NODE_NAME"),
+        "source": "environment",
+    }
+
+
+class RuntimeAllocator:
+    """In-container case-level allocator backed by one host-level allocation."""
+
+    def __init__(self, allocation: dict[str, Any], wait_sec: int) -> None:
+        self._available_cards = sorted(allocation_cards(allocation))
+        self._available_ports = sorted(allocation_ports(allocation))
+        self._total_cards = len(self._available_cards)
+        self._total_ports = len(self._available_ports)
+        self._host_node = allocation.get("host_node")
+        self._container_name = allocation.get("container_name")
+        self._wait_sec = wait_sec
+        self._condition = threading.Condition()
+
+    def allocate(self, card_count: int, port_count: int, label: str) -> dict[str, Any] | None:
+        if card_count > self._total_cards or port_count > self._total_ports:
+            return None
+        deadline = time.monotonic() + self._wait_sec
+        with self._condition:
+            while len(self._available_cards) < card_count or len(self._available_ports) < port_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(timeout=min(remaining, 5))
+
+            cards = self._available_cards[:card_count]
+            ports = self._available_ports[:port_count]
+            del self._available_cards[:card_count]
+            del self._available_ports[:port_count]
+            return {
+                "cards": cards,
+                "ports": ports,
+                "card_count": card_count,
+                "port_count": port_count,
+                "label": label,
+                "host_node": self._host_node,
+                "container_name": self._container_name,
+            }
+
+    def release(self, allocation: dict[str, Any] | None) -> None:
+        if not allocation:
+            return
+        with self._condition:
+            self._available_cards.extend(allocation_cards(allocation))
+            self._available_ports.extend(allocation_ports(allocation))
+            self._available_cards = sorted(set(self._available_cards))
+            self._available_ports = sorted(set(self._available_ports))
+            self._condition.notify_all()
+
+
 def _result_skeleton(case: dict[str, Any], allocation: dict[str, Any] | None = None) -> dict[str, Any]:
     cards = allocation_cards(allocation)
     ports = allocation_ports(allocation)
@@ -93,7 +171,10 @@ def _result_skeleton(case: dict[str, Any], allocation: dict[str, Any] | None = N
         "failure_reason": None,
         "allocated_cards": cards,
         "allocated_ports": ports,
-        "container_name": os.getenv("VLLM_CI_CONTAINER_NAME") or os.getenv("HOSTNAME") or None,
+        "container_name": (allocation or {}).get("container_name")
+        or os.getenv("VLLM_CI_CONTAINER_NAME")
+        or os.getenv("HOSTNAME")
+        or None,
         "host_node": (allocation or {}).get("host_node") or os.getenv("NODE_NAME") or None,
         "startup": stage_result(STATUS_SKIPPED),
         "readiness": stage_result(STATUS_SKIPPED),
@@ -247,70 +328,156 @@ def _terminate_process(process: subprocess.Popen[Any] | None) -> None:
             os.killpg(process.pid, signal.SIGKILL)
 
 
-def _run_one_case(case_path: str, args: argparse.Namespace) -> dict[str, Any]:
+def _terminate_processes(processes: list[subprocess.Popen[Any]]) -> None:
+    for process in reversed(processes):
+        _terminate_process(process)
+
+
+def _service_card_allocations(
+    case: dict[str, Any],
+    services: list[dict[str, Any]],
+    cards: list[int],
+) -> list[list[int]]:
+    if len(services) == 1:
+        return [cards]
+
+    allocations: list[list[int]] = []
+    offset = 0
+    for service in services:
+        count = service_card_count(service)
+        if count is None:
+            raise ValueError(f"{case_name(case)}: service {service.get('name')} requires resources.card_count")
+        if count < 1:
+            raise ValueError(f"{case_name(case)}: service {service.get('name')} resources.card_count must be >= 1")
+        next_offset = offset + count
+        if next_offset > len(cards):
+            raise ValueError(f"{case_name(case)}: service card counts exceed allocated cards {cards}")
+        allocations.append(cards[offset:next_offset])
+        offset = next_offset
+    return allocations
+
+
+def _run_one_case(
+    case_path: str,
+    args: argparse.Namespace,
+    allocation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     case = load_case(case_path)
-    allocation = _load_allocation(args.allocation_json)
     apply_allocation(case, allocation)
     result = _result_skeleton(case, allocation)
+    services = [service for service in case.get("services", []) if isinstance(service, dict)]
     service = first_service(case)
     output_dir = Path(args.output_dir)
     logs_dir = Path(args.logs_dir)
     log_path = _log_path(case, service, logs_dir)
     result["artifacts"]["server_log"] = str(log_path)
+    result["artifacts"]["server_logs"] = {
+        str(item.get("name")): str(_log_path(case, item, logs_dir)) for item in services
+    }
     if args.allocation_json:
         result["artifacts"]["allocation_json"] = args.allocation_json
-    process: subprocess.Popen[Any] | None = None
+    processes: list[subprocess.Popen[Any]] = []
 
     try:
-        if len(case.get("services") or []) != 1 or service.get("type") != "vllm-serve":
+        if not services or any(item.get("type") != "vllm-serve" for item in services):
             result["status"] = STATUS_SKIPPED
-            reason = "MVP runner supports exactly one vllm-serve service"
+            reason = "runner supports vllm-serve services only"
             result["failure_stage"] = "topology"
             result["failure_reason"] = reason
             result["startup"] = stage_result(STATUS_SKIPPED, reason=reason)
             return result
 
         env = _case_env(case, args.model_root)
-        command = build_vllm_serve_command(case, service, {"MODEL_ROOT": args.model_root})
-        result["artifacts"]["serve_command"] = command_to_shell(command)
+        service_cards = _service_card_allocations(case, services, allocation_cards(allocation))
+        service_commands = [
+            build_vllm_serve_command(case, item, {"MODEL_ROOT": args.model_root}) for item in services
+        ]
+        result["artifacts"]["serve_command"] = command_to_shell(service_commands[0])
+        result["artifacts"]["serve_commands"] = {
+            str(item.get("name")): command_to_shell(command)
+            for item, command in zip(services, service_commands, strict=False)
+        }
 
         if args.dry_run:
             result["status"] = STATUS_SKIPPED
-            result["startup"] = stage_result(STATUS_SKIPPED, reason="dry-run", command=command_to_shell(command))
+            result["startup"] = stage_result(
+                STATUS_SKIPPED,
+                reason="dry-run",
+                command=command_to_shell(service_commands[0]),
+                services=[
+                    {
+                        "name": item.get("name"),
+                        "cards": cards,
+                        "command": command_to_shell(command),
+                    }
+                    for item, cards, command in zip(services, service_cards, service_commands, strict=False)
+                ],
+            )
             return result
 
         workdir = expand_text(case.get("runtime", {}).get("workdir", "."), env)
         cwd = workdir if Path(workdir).exists() else "."
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w", encoding="utf-8") as log_file:
-            log_file.write(f"$ {command_to_shell(command)}\n")
-            started = time.monotonic()
-            process = subprocess.Popen(
-                command,
-                cwd=cwd,
-                env=env,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                text=True,
-                start_new_session=True,
+        started = time.monotonic()
+        started_services: list[dict[str, Any]] = []
+        for item, cards, command in zip(services, service_cards, service_commands, strict=False):
+            item_log_path = _log_path(case, item, logs_dir)
+            item_log_path.parent.mkdir(parents=True, exist_ok=True)
+            item_env = dict(env)
+            if cards:
+                item_env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(str(card) for card in cards)
+            with item_log_path.open("w", encoding="utf-8") as log_file:
+                log_file.write(f"$ {command_to_shell(command)}\n")
+                process = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=item_env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,
+                )
+            processes.append(process)
+            pid_path = item_log_path.with_suffix(".pid")
+            pid_path.write_text(str(process.pid), encoding="utf-8")
+            started_services.append(
+                {
+                    "name": item.get("name"),
+                    "pid": process.pid,
+                    "cards": cards,
+                    "command": command_to_shell(command),
+                    "log_file": str(item_log_path),
+                    "pid_file": str(pid_path),
+                }
             )
         result["startup"] = stage_result(
             STATUS_PASSED,
-            pid=process.pid,
-            command=command_to_shell(command),
+            services=started_services,
             duration_sec=round(time.monotonic() - started, 3),
         )
-        pid_path = log_path.with_suffix(".pid")
-        pid_path.write_text(str(process.pid), encoding="utf-8")
-        result["artifacts"]["pid_file"] = str(pid_path)
+
+        readiness_results = []
+        for item in services:
+            host = str(item.get("host", "127.0.0.1"))
+            port = int(item.get("port", 8000))
+            item_readiness = _wait_for_readiness(host, port, case.get("checks", {}).get("readiness") or {})
+            item_readiness["service"] = item.get("name")
+            readiness_results.append(item_readiness)
+        readiness_status = (
+            STATUS_PASSED
+            if all(item.get("status") == STATUS_PASSED for item in readiness_results)
+            else STATUS_FAILED
+        )
+        result["readiness"] = stage_result(readiness_status, services=readiness_results)
+        if readiness_status != STATUS_PASSED:
+            failed_reason = next(
+                (item.get("failure_reason") for item in readiness_results if item.get("status") != STATUS_PASSED),
+                "readiness failed",
+            )
+            _mark_failed(result, "readiness", str(failed_reason))
+            return result
 
         host = str(service.get("host", "127.0.0.1"))
         port = int(service.get("port", 8000))
-        result["readiness"] = _wait_for_readiness(host, port, case.get("checks", {}).get("readiness") or {})
-        if result["readiness"]["status"] != STATUS_PASSED:
-            _mark_failed(result, "readiness", result["readiness"].get("failure_reason", "readiness failed"))
-            return result
-
         smoke = case.get("tests", {}).get("smoke") or {}
         if smoke.get("enabled", True):
             endpoint = smoke.get("endpoint", "/v1/completions")
@@ -374,9 +541,49 @@ def _run_one_case(case_path: str, args: argparse.Namespace) -> dict[str, Any]:
         _mark_failed(result, result.get("failure_stage") or "runtime", str(exc))
         return result
     finally:
-        _terminate_process(process)
+        _terminate_processes(processes)
         output_dir.mkdir(parents=True, exist_ok=True)
         write_json(output_dir / f"{safe_slug(case_name(case))}.json", result)
+
+
+def _allocation_failure_result(case_path: str, args: argparse.Namespace, reason: str) -> dict[str, Any]:
+    case = load_case(case_path)
+    result = _result_skeleton(case)
+    _mark_failed(result, "allocation", reason)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(output_dir / f"{safe_slug(case_name(case))}.json", result)
+    return result
+
+
+def _case_port_count(case: dict[str, Any]) -> int:
+    return len(case.get("services") or [])
+
+
+def _run_one_case_with_allocator(
+    case_path: str,
+    args: argparse.Namespace,
+    allocator: RuntimeAllocator | None,
+    fallback_allocation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if allocator is None:
+        return _run_one_case(case_path, args, fallback_allocation)
+
+    case = load_case(case_path)
+    card_count = case_card_count(case)
+    port_count = _case_port_count(case)
+    allocation = allocator.allocate(card_count, port_count, case_name(case))
+    if allocation is None:
+        return _allocation_failure_result(
+            case_path,
+            args,
+            f"timed out waiting for {card_count} card(s) and {port_count} port(s)",
+        )
+
+    try:
+        return _run_one_case(case_path, args, allocation)
+    finally:
+        allocator.release(allocation)
 
 
 def main() -> int:
@@ -386,15 +593,36 @@ def main() -> int:
         print(f"case list is empty: {args.case_list}")
         return 1
 
+    base_allocation = _load_allocation(args.allocation_json) or _allocation_from_env()
+    allocator = RuntimeAllocator(base_allocation, args.allocation_wait_sec) if base_allocation else None
+    if args.parallelism < 0:
+        print("--parallelism must be >= 0")
+        return 1
+    workers = len(paths) if args.parallelism == 0 else max(args.parallelism, 1)
+    workers = max(1, min(workers, len(paths)))
+
     failures = 0
-    for path in paths:
-        print(f"running DeployCase: {path}")
-        result = _run_one_case(path, args)
-        print(f"{result['case_name']}: {result['status']}")
-        if result["status"] == STATUS_FAILED:
-            failures += 1
-            if not args.continue_on_error:
-                break
+    if workers == 1:
+        for path in paths:
+            print(f"running DeployCase: {path}")
+            result = _run_one_case_with_allocator(path, args, allocator, base_allocation)
+            print(f"{result['case_name']}: {result['status']}")
+            if result["status"] == STATUS_FAILED:
+                failures += 1
+                if not args.continue_on_error:
+                    break
+    else:
+        print(f"running {len(paths)} DeployCase(s) with in-container parallelism={workers}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_run_one_case_with_allocator, path, args, allocator, base_allocation): path
+                for path in paths
+            }
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                print(f"{result['case_name']}: {result['status']}")
+                if result["status"] == STATUS_FAILED:
+                    failures += 1
 
     if failures:
         print(f"{failures} DeployCase run(s) failed")

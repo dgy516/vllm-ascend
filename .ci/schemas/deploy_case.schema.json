@@ -59,10 +59,11 @@
         "env": {"type": "object"},
         "docker": {
           "type": "object",
-          "required": ["enabled", "image", "network", "shm_size", "mounts"],
+          "required": ["enabled", "image", "workspace", "network", "shm_size", "mounts"],
           "properties": {
             "enabled": {"const": true},
             "image": {"type": "string"},
+            "workspace": {"const": "/home/ma-user/AscendCloud/jenkins"},
             "network": {"const": "host"},
             "ipc": {"type": "string"},
             "shm_size": {"type": "string"},

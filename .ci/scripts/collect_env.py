@@ -48,6 +48,9 @@ def main() -> int:
         "MODEL_ROOT",
         "ASCEND_LABEL",
         "ASCEND_LOCK_LABEL",
+        "ASCEND_DOCKER_IMAGE",
+        "RUNTIME_PARALLELISM",
+        "DRY_RUN_RUNTIME",
         "IMAGE_TAG",
     ]
     payload: dict[str, Any] = {

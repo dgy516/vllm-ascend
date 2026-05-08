@@ -31,7 +31,12 @@ def parse_args() -> argparse.Namespace:
             "then optionally run a child command while holding the locks."
         )
     )
-    parser.add_argument("--card-count", type=int, required=True, help="Number of Ascend cards to allocate")
+    parser.add_argument(
+        "--card-count",
+        type=int,
+        required=True,
+        help="Number of Ascend cards to allocate; 0 means all detected cards",
+    )
     parser.add_argument("--port-count", type=int, required=True, help="Number of host ports to allocate")
     parser.add_argument("--output", required=True, help="Allocation JSON path")
     parser.add_argument("--npu-lock-dir", default="/tmp/vllm-ascend-ci/npu", help="Directory for card lock files")
@@ -140,8 +145,8 @@ def _try_allocate(
 
 
 def _allocate(args: argparse.Namespace) -> tuple[list[int], list[int], list[TextIO]]:
-    if args.card_count < 1:
-        raise ValueError("--card-count must be >= 1")
+    if args.card_count < 0:
+        raise ValueError("--card-count must be >= 0")
     if args.port_count < 1:
         raise ValueError("--port-count must be >= 1")
     if args.port_start > args.port_end:
@@ -156,8 +161,9 @@ def _allocate(args: argparse.Namespace) -> tuple[list[int], list[int], list[Text
         raise RuntimeError(
             "could not detect Ascend card count; pass --total-cards or set VLLM_CI_TOTAL_CARDS"
         )
-    if args.card_count > total_cards:
-        raise RuntimeError(f"requested {args.card_count} card(s), but host exposes {total_cards}")
+    requested_card_count = total_cards if args.card_count == 0 else args.card_count
+    if requested_card_count > total_cards:
+        raise RuntimeError(f"requested {requested_card_count} card(s), but host exposes {total_cards}")
 
     card_items = list(range(total_cards))
     port_items = list(range(args.port_start, args.port_end + 1))
@@ -165,7 +171,7 @@ def _allocate(args: argparse.Namespace) -> tuple[list[int], list[int], list[Text
     all_handles: list[TextIO] = []
 
     while True:
-        cards, card_handles = _try_allocate(card_items, args.card_count, Path(args.npu_lock_dir), "card")
+        cards, card_handles = _try_allocate(card_items, requested_card_count, Path(args.npu_lock_dir), "card")
         if cards:
             ports, port_handles = _try_allocate(
                 port_items,
@@ -182,7 +188,7 @@ def _allocate(args: argparse.Namespace) -> tuple[list[int], list[int], list[Text
 
         if time.monotonic() >= deadline:
             raise TimeoutError(
-                f"timed out allocating {args.card_count} card(s) and {args.port_count} port(s)"
+                f"timed out allocating {requested_card_count} card(s) and {args.port_count} port(s)"
             )
         time.sleep(args.poll_sec)
 
@@ -191,9 +197,11 @@ def _allocation_payload(args: argparse.Namespace, cards: list[int], ports: list[
     return {
         "cards": cards,
         "ports": ports,
-        "card_count": args.card_count,
+        "card_count": len(cards),
+        "requested_card_count": args.card_count,
         "port_count": args.port_count,
         "host_node": os.getenv("NODE_NAME") or socket.gethostname(),
+        "container_name": os.getenv("VLLM_CI_CONTAINER_NAME"),
         "npu_lock_dir": args.npu_lock_dir,
         "port_lock_dir": args.port_lock_dir,
         "dry_run": bool(args.dry_run),

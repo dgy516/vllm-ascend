@@ -9,6 +9,7 @@ from typing import Any
 
 from deploy_case_lib import (
     ALLOWED_SOCS,
+    CONTAINER_WORKSPACE,
     build_vllm_serve_command,
     case_card_count,
     case_name,
@@ -101,6 +102,10 @@ def _validate_runtime_resources(case: dict[str, Any], command: list[str]) -> lis
         errors.append(f"{case_name(case)}: runtime.docker.enabled must be true")
     if not docker.get("image"):
         errors.append(f"{case_name(case)}: runtime.docker.image is required")
+    if case.get("runtime", {}).get("workdir") != CONTAINER_WORKSPACE:
+        errors.append(f"{case_name(case)}: runtime.workdir must be {CONTAINER_WORKSPACE}")
+    if docker.get("workspace") != CONTAINER_WORKSPACE:
+        errors.append(f"{case_name(case)}: runtime.docker.workspace must be {CONTAINER_WORKSPACE}")
     if docker.get("network") != "host":
         errors.append(f"{case_name(case)}: runtime.docker.network must be host")
     if not docker.get("shm_size"):
@@ -117,6 +122,17 @@ def _validate_runtime_resources(case: dict[str, Any], command: list[str]) -> lis
                 errors.append(f"{case_name(case)}: runtime.docker.mounts[{index}] requires source and target")
             if mount.get("mode") not in {"ro", "rw"}:
                 errors.append(f"{case_name(case)}: runtime.docker.mounts[{index}].mode must be ro or rw")
+        targets = {str(mount.get("target")) for mount in mounts if isinstance(mount, dict)}
+        if "/workspace/vllm-ascend" in targets:
+            errors.append(f"{case_name(case)}: runtime.docker.mounts must not target /workspace/vllm-ascend")
+        required_targets = {
+            f"{CONTAINER_WORKSPACE}/.ci",
+            f"{CONTAINER_WORKSPACE}/reports",
+            f"{CONTAINER_WORKSPACE}/logs",
+        }
+        missing_targets = sorted(required_targets - targets)
+        if missing_targets:
+            errors.append(f"{case_name(case)}: missing runtime.docker mount targets: {missing_targets}")
     return errors
 
 
@@ -158,13 +174,16 @@ def main() -> int:
             case = load_case(path)
             entry["case_name"] = case_name(case)
             errors, warnings = validate_case(case, path)
-            service = first_service(case)
-            if service.get("type") != "vllm-serve":
-                errors.append(f"{case_name(case)}: only vllm-serve is supported in MVP")
-            command = build_vllm_serve_command(case, service, {"MODEL_ROOT": args.model_root})
-            entry["command"] = command_to_shell(command)
-            errors.extend(_validate_flag_types(command))
-            errors.extend(_validate_runtime_resources(case, command))
+            commands = []
+            for service in case.get("services") or [first_service(case)]:
+                if service.get("type") != "vllm-serve":
+                    errors.append(f"{case_name(case)}: only vllm-serve is supported in MVP")
+                    continue
+                command = build_vllm_serve_command(case, service, {"MODEL_ROOT": args.model_root})
+                commands.append(command_to_shell(command))
+                errors.extend(_validate_flag_types(command))
+                errors.extend(_validate_runtime_resources(case, command))
+            entry["command"] = "\n".join(commands)
             if args.check_model_path:
                 errors.extend(_check_model_path(case, args.model_root))
         except Exception as exc:  # noqa: BLE001 - convert to clear JSON report

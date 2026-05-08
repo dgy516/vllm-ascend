@@ -31,7 +31,7 @@
 
 {{ topology }}
 
-本 case 在 Jenkins runtime 中申请 `{{ card_count }}` 张 Ascend 卡。卡号和端口由 `.ci/scripts/with_runtime_allocation.py` 在宿主机分配，并通过 `ASCEND_RT_VISIBLE_DEVICES` 和 `VLLM_CI_ALLOCATED_PORTS` 注入容器。
+Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/with_runtime_allocation.py` 在宿主机分配；容器内 runner 再按 `requirements.hardware.card_count={{ card_count }}` 为本 case 分配子卡集和端口。
 
 ## 5. 环境变量
 
@@ -98,7 +98,7 @@ Docker 配置：
 ## 13. 注意事项
 
 - Jenkins 默认 `RUN_ASCEND=false`，不会在静态流程中启动真实模型。
-- 一个 Jenkins parallel branch 对应一个 Docker 容器，容器只看到分配到的 Ascend 卡。
-- 大模型 case 会按 `requirements.hardware.card_count` 申请更多卡；`ASCEND_LOCK_LABEL` 只作为可选外层保护。
+- A2/A3 runtime 均采用单容器内并发，不在同一节点上启动多个 Ascend workload 容器。
+- 大模型 case 会按 `requirements.hardware.card_count` 申请更多卡；`ASCEND_LOCK_LABEL` 可作为整机外层保护。
 - `reports/` 和 `logs/` 是运行时产物目录，不应提交到 Git。
-- PD、多服务和多机场景在第一版中只预留结构，runner 暂不执行。
+- PD 分离可在同一容器内通过多个 `services[]` 进程表达；多机拓扑仍预留。

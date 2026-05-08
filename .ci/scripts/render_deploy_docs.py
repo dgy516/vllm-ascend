@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 from deploy_case_lib import (
     ALLOWED_LEVELS,
+    CONTAINER_WORKSPACE,
     build_vllm_serve_command,
     case_card_count,
     case_level,
@@ -138,15 +139,25 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
     docker_command = (
         "docker run --rm \\\n"
         f"  --name vllm-ascend-ci-{case_name(case)} \\\n"
-        f"  --network {docker.get('network', 'host')} \\\n"
-        f"  --ipc {docker.get('ipc', 'host')} \\\n"
-        f"  --shm-size {docker.get('shm_size', '64g')} \\\n"
+        "  --network host \\\n"
+        "  --ipc host \\\n"
+        f"  --shm-size={docker.get('shm_size', '1g')} \\\n"
+        "  --device /dev/davinci0 \\\n"
+        "  --device /dev/davinci_manager \\\n"
+        "  --device /dev/devmm_svm \\\n"
+        "  --device /dev/hisi_hdc \\\n"
         "  ${ASCEND_DOCKER_DEVICE_ARGS} \\\n"
+        "  -v /usr/local/dcmi:/usr/local/dcmi \\\n"
+        "  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \\\n"
+        "  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \\\n"
+        "  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \\\n"
+        "  -v /etc/ascend_install.info:/etc/ascend_install.info \\\n"
+        "  -v /root/.cache:/root/.cache \\\n"
         "  -e ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES} \\\n"
         "  -e VLLM_CI_ALLOCATED_PORTS=${VLLM_CI_ALLOCATED_PORTS} \\\n"
         "  -e MODEL_ROOT=${MODEL_ROOT} \\\n"
         f"  {_docker_mounts(docker.get('mounts') or [])} \\\n"
-        "  -w /workspace/vllm-ascend \\\n"
+        f"  -w {CONTAINER_WORKSPACE} \\\n"
         f"  {docker.get('image', '${ASCEND_DOCKER_IMAGE}')} \\\n"
         f"  {serve_shell}"
     )

@@ -17,6 +17,7 @@ API_VERSION = "llm-ci/v1"
 KIND = "DeployCase"
 ALLOWED_LEVELS = {"static", "smoke", "nightly", "release", "benchmark"}
 ALLOWED_SOCS = {"A2", "A3", "any"}
+CONTAINER_WORKSPACE = "/home/ma-user/AscendCloud/jenkins"
 STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
@@ -143,6 +144,16 @@ def hardware_config(case: dict[str, Any]) -> dict[str, Any]:
 def docker_config(case: dict[str, Any]) -> dict[str, Any]:
     docker = case.get("runtime", {}).get("docker") or {}
     return docker if isinstance(docker, dict) else {}
+
+
+def service_card_count(service: dict[str, Any]) -> int | None:
+    resources = service.get("resources") or {}
+    if not isinstance(resources, dict) or resources.get("card_count") is None:
+        return None
+    try:
+        return int(resources["card_count"])
+    except (TypeError, ValueError):
+        raise DeployCaseError(f"service {service.get('name')}: resources.card_count must be an integer") from None
 
 
 def case_card_count(case: dict[str, Any]) -> int:
@@ -320,6 +331,7 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
         "runtime.docker",
         "runtime.docker.enabled",
         "runtime.docker.image",
+        "runtime.docker.workspace",
         "runtime.docker.network",
         "runtime.docker.shm_size",
         "runtime.docker.mounts",
@@ -335,6 +347,9 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
     level = get_path(case, "metadata.level")
     if level not in ALLOWED_LEVELS:
         errors.append(f"{label}: metadata.level must be one of {sorted(ALLOWED_LEVELS)}")
+
+    if get_path(case, "runtime.workdir") != CONTAINER_WORKSPACE:
+        errors.append(f"{label}: runtime.workdir must be {CONTAINER_WORKSPACE}")
 
     hardware = hardware_config(case)
     soc = hardware.get("soc")
@@ -353,6 +368,8 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
     docker = docker_config(case)
     if docker.get("enabled") is not True:
         errors.append(f"{label}: runtime.docker.enabled must be true for Jenkins runtime execution")
+    if docker.get("workspace") != CONTAINER_WORKSPACE:
+        errors.append(f"{label}: runtime.docker.workspace must be {CONTAINER_WORKSPACE}")
     if docker.get("network") != "host":
         errors.append(f"{label}: runtime.docker.network must be host in the MVP runner")
     mounts = docker.get("mounts")
@@ -360,6 +377,18 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
         errors.append(f"{label}: runtime.docker.mounts must be a non-empty list")
     elif any(not isinstance(mount, dict) for mount in mounts):
         errors.append(f"{label}: each runtime.docker.mounts entry must be a mapping")
+    else:
+        targets = {str(mount.get("target")) for mount in mounts}
+        if "/workspace/vllm-ascend" in targets:
+            errors.append(f"{label}: runtime.docker.mounts must not target /workspace/vllm-ascend")
+        required_targets = {
+            f"{CONTAINER_WORKSPACE}/.ci",
+            f"{CONTAINER_WORKSPACE}/reports",
+            f"{CONTAINER_WORKSPACE}/logs",
+        }
+        missing_targets = sorted(required_targets - targets)
+        if missing_targets:
+            errors.append(f"{label}: runtime.docker.mounts missing required target(s): {missing_targets}")
 
     services = case.get("services")
     if not isinstance(services, list) or not services:
@@ -368,6 +397,7 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
 
     service_names: set[str] = set()
     ports: set[int] = set()
+    service_card_total = 0
     for index, service in enumerate(services):
         if not isinstance(service, dict):
             errors.append(f"{label}: services[{index}] must be a mapping")
@@ -400,8 +430,30 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
                 errors.append(f"{label}: service {name} type vllm-serve requires vllm.model")
             elif not isinstance(vllm.get("args", []), list):
                 errors.append(f"{label}: service {name} vllm.args must be a list")
+            if len(services) > 1:
+                try:
+                    service_cards = service_card_count(service)
+                except DeployCaseError as exc:
+                    errors.append(f"{label}: {exc}")
+                    service_cards = None
+                if service_cards is None:
+                    errors.append(f"{label}: service {name} resources.card_count is required for multi-service cases")
+                elif service_cards < 1:
+                    errors.append(f"{label}: service {name} resources.card_count must be >= 1")
+                else:
+                    service_card_total += service_cards
         else:
             warnings.append(f"{label}: service {name} type {service.get('type')} is reserved for future runners")
+    if len(services) > 1:
+        try:
+            card_count = case_card_count(case)
+            if service_card_total > card_count:
+                errors.append(
+                    f"{label}: sum of services[].resources.card_count ({service_card_total}) "
+                    f"must not exceed requirements.hardware.card_count ({card_count})"
+                )
+        except DeployCaseError as exc:
+            errors.append(f"{label}: {exc}")
 
     smoke = case.get("tests", {}).get("smoke") or {}
     if isinstance(smoke, dict) and smoke.get("enabled", True):

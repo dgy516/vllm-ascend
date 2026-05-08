@@ -40,12 +40,13 @@ Minimal two-card single-service vLLM Ascend smoke case for Jenkins card-level co
 
 - Service `qwen25-smoke` runs as `vllm-serve` on `127.0.0.1:8000` with role `serve`.
 
-本 case 在 Jenkins runtime 中申请 `2` 张 Ascend 卡。卡号和端口由 `.ci/scripts/with_runtime_allocation.py` 在宿主机分配，并通过 `ASCEND_RT_VISIBLE_DEVICES` 和 `VLLM_CI_ALLOCATED_PORTS` 注入容器。
+Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/with_runtime_allocation.py` 在宿主机分配；容器内 runner 再按 `requirements.hardware.card_count=2` 为本 case 分配子卡集和端口。
 
 ## 5. 环境变量
 
 ```bash
 export VLLM_USE_MODELSCOPE=true
+export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256
 ```
 
 ## 6. 启动服务命令
@@ -63,14 +64,26 @@ docker run --rm \
   --name vllm-ascend-ci-qwen25-05b-smoke \
   --network host \
   --ipc host \
-  --shm-size 64g \
+  --shm-size=1g \
+  --device /dev/davinci0 \
+  --device /dev/davinci_manager \
+  --device /dev/devmm_svm \
+  --device /dev/hisi_hdc \
   ${ASCEND_DOCKER_DEVICE_ARGS} \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v /root/.cache:/root/.cache \
   -e ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES} \
   -e VLLM_CI_ALLOCATED_PORTS=${VLLM_CI_ALLOCATED_PORTS} \
   -e MODEL_ROOT=${MODEL_ROOT} \
-  -v ${WORKSPACE}:/workspace/vllm-ascend:rw \
+  -v ${WORKSPACE}/.ci:/home/ma-user/AscendCloud/jenkins/.ci:ro \
+  -v ${WORKSPACE}/reports:/home/ma-user/AscendCloud/jenkins/reports:rw \
+  -v ${WORKSPACE}/logs:/home/ma-user/AscendCloud/jenkins/logs:rw \
   -v ${MODEL_ROOT}:${MODEL_ROOT}:ro \
-  -w /workspace/vllm-ascend \
+  -w /home/ma-user/AscendCloud/jenkins \
   ${ASCEND_DOCKER_IMAGE} \
   vllm serve Qwen/Qwen2.5-0.5B-Instruct --served-model-name qwen25-05b-smoke --host 127.0.0.1 --port 8000 --tensor-parallel-size 2 --max-model-len 2048 --max-num-batched-tokens 2048 --trust-remote-code
 ```
@@ -79,15 +92,24 @@ Docker 配置：
 
 - `enabled`: True
 - `image`: ${ASCEND_DOCKER_IMAGE}
+- `workspace`: /home/ma-user/AscendCloud/jenkins
 - `network`: host
 - `ipc`: host
-- `shm_size`: 64g
+- `shm_size`: 1g
 - `mounts`:
   - item 1:
-    - `source`: ${WORKSPACE}
-    - `target`: /workspace/vllm-ascend
-    - `mode`: rw
+    - `source`: ${WORKSPACE}/.ci
+    - `target`: /home/ma-user/AscendCloud/jenkins/.ci
+    - `mode`: ro
   - item 2:
+    - `source`: ${WORKSPACE}/reports
+    - `target`: /home/ma-user/AscendCloud/jenkins/reports
+    - `mode`: rw
+  - item 3:
+    - `source`: ${WORKSPACE}/logs
+    - `target`: /home/ma-user/AscendCloud/jenkins/logs
+    - `mode`: rw
+  - item 4:
     - `source`: ${MODEL_ROOT}
     - `target`: ${MODEL_ROOT}
     - `mode`: ro
@@ -164,7 +186,7 @@ pkill -f 'vllm serve Qwen/Qwen2.5-0.5B-Instruct' || true
 ## 13. 注意事项
 
 - Jenkins 默认 `RUN_ASCEND=false`，不会在静态流程中启动真实模型。
-- 一个 Jenkins parallel branch 对应一个 Docker 容器，容器只看到分配到的 Ascend 卡。
-- 大模型 case 会按 `requirements.hardware.card_count` 申请更多卡；`ASCEND_LOCK_LABEL` 只作为可选外层保护。
+- A2/A3 runtime 均采用单容器内并发，不在同一节点上启动多个 Ascend workload 容器。
+- 大模型 case 会按 `requirements.hardware.card_count` 申请更多卡；`ASCEND_LOCK_LABEL` 可作为整机外层保护。
 - `reports/` 和 `logs/` 是运行时产物目录，不应提交到 Git。
-- PD、多服务和多机场景在第一版中只预留结构，runner 暂不执行。
+- PD 分离可在同一容器内通过多个 `services[]` 进程表达；多机拓扑仍预留。
