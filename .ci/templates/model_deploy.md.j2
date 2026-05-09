@@ -31,7 +31,7 @@
 
 {{ topology }}
 
-Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/with_runtime_allocation.py` 在宿主机分配；容器内 runner 再按 `requirements.hardware.card_count={{ card_count }}` 为本 case 分配子卡集和端口。
+Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/run_runtime_container.py` 在宿主机分配并持锁；容器内 runner 再按 `requirements.hardware.card_count={{ card_count }}` 为本 case 分配子卡集和端口。
 
 ## 5. 环境变量
 

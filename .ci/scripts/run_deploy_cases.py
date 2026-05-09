@@ -32,6 +32,7 @@ from deploy_case_lib import (
     expand_text,
     first_service,
     load_case,
+    load_smoke_test_cases,
     read_case_list,
     read_json,
     safe_slug,
@@ -189,7 +190,10 @@ def _mark_failed(result: dict[str, Any], stage: str, reason: str) -> None:
     result["status"] = STATUS_FAILED
     result["failure_stage"] = stage
     result["failure_reason"] = reason
-    result[stage] = stage_result(STATUS_FAILED, failure_reason=reason)
+    stage_payload = result.get(stage) if isinstance(result.get(stage), dict) else {}
+    stage_payload["status"] = STATUS_FAILED
+    stage_payload["failure_reason"] = reason
+    result[stage] = stage_payload
 
 
 def _case_env(case: dict[str, Any], model_root: str) -> dict[str, str]:
@@ -244,22 +248,39 @@ def _wait_for_readiness(host: str, port: int, readiness: dict[str, Any]) -> dict
     )
 
 
-def _post_json(url: str, payload: dict[str, Any], expected_status: int) -> dict[str, Any]:
+def _request_json(
+    method: str,
+    url: str,
+    payload: dict[str, Any],
+    expected_status: int,
+    timeout_sec: int,
+) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=data,
         headers={"Content-Type": "application/json"},
-        method="POST",
+        method=method,
     )
     started = time.monotonic()
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
             body = response.read().decode("utf-8", errors="replace")
             http_status = response.status
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         http_status = exc.code
+    except urllib.error.URLError as exc:
+        return stage_result(
+            STATUS_FAILED,
+            url=url,
+            http_status=None,
+            output_tokens=None,
+            duration_sec=round(time.monotonic() - started, 3),
+            response_preview="",
+            response_text="",
+            failure_reason=str(exc),
+        )
 
     status = STATUS_PASSED if http_status == expected_status else STATUS_FAILED
     parsed: dict[str, Any] = {}
@@ -282,7 +303,115 @@ def _post_json(url: str, payload: dict[str, Any], expected_status: int) -> dict[
         http_status=http_status,
         output_tokens=output_tokens,
         duration_sec=round(time.monotonic() - started, 3),
-        response_preview=body[:500],
+        response_preview=body[:1000],
+        response_text=body,
+    )
+
+
+def _finalize_smoke_case(test_case: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "id": test_case["id"],
+        "suite_file": test_case["suite_file"],
+        "mode": test_case["mode"],
+        "status": response.get("status", STATUS_FAILED),
+        "http_status": response.get("http_status"),
+        "expected_http_status": test_case.get("expected_http_status"),
+        "duration_sec": response.get("duration_sec", 0),
+        "output_tokens": response.get("output_tokens"),
+        "response_preview": response.get("response_preview", ""),
+        "description": test_case.get("description", ""),
+    }
+    body = str(response.get("response_text", ""))
+    if result["status"] == STATUS_PASSED:
+        min_output_tokens = test_case.get("min_output_tokens")
+        if min_output_tokens is not None:
+            output_tokens = response.get("output_tokens")
+            if output_tokens is None or int(output_tokens) < int(min_output_tokens):
+                result["status"] = STATUS_FAILED
+                result["failure_reason"] = (
+                    f"output_tokens {output_tokens} is lower than min_output_tokens {min_output_tokens}"
+                )
+        expected_text = str(test_case.get("response_contains") or "")
+        if result["status"] == STATUS_PASSED and expected_text and expected_text not in body:
+            result["status"] = STATUS_FAILED
+            result["failure_reason"] = f"response does not contain {expected_text!r}"
+        forbidden_text = str(test_case.get("response_not_contains") or "")
+        if result["status"] == STATUS_PASSED and forbidden_text and forbidden_text in body:
+            result["status"] = STATUS_FAILED
+            result["failure_reason"] = f"response contains forbidden text {forbidden_text!r}"
+    else:
+        result["failure_reason"] = response.get("failure_reason") or (
+            f"HTTP status {response.get('http_status')} != {test_case.get('expected_http_status')}"
+        )
+    return result
+
+
+def _run_smoke_suite(
+    case: dict[str, Any],
+    service: dict[str, Any],
+    model_root: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    tests = load_smoke_test_cases(case, model_root=model_root, service=service)
+    suite_files = sorted({str(item.get("suite_file")) for item in tests})
+    if not tests:
+        return stage_result(STATUS_SKIPPED, reason="no smoke tests selected", total=0, cases=[], suite_files=[])
+
+    started = time.monotonic()
+    case_results: list[dict[str, Any]] = []
+    for test_case in tests:
+        if not test_case.get("enabled", True):
+            case_results.append(
+                {
+                    "id": test_case["id"],
+                    "suite_file": test_case["suite_file"],
+                    "status": STATUS_SKIPPED,
+                    "reason": "disabled",
+                    "description": test_case.get("description", ""),
+                }
+            )
+            continue
+        url = f"http://{service.get('host', '127.0.0.1')}:{service.get('port', 8000)}{test_case['endpoint']}"
+        if dry_run:
+            case_results.append(
+                {
+                    "id": test_case["id"],
+                    "suite_file": test_case["suite_file"],
+                    "mode": test_case["mode"],
+                    "status": STATUS_SKIPPED,
+                    "reason": "dry-run",
+                    "method": test_case["method"],
+                    "url": url,
+                    "expected_http_status": test_case["expected_http_status"],
+                    "description": test_case.get("description", ""),
+                }
+            )
+            continue
+        response = _request_json(
+            str(test_case["method"]),
+            url,
+            test_case["payload"],
+            int(test_case["expected_http_status"]),
+            int(test_case["timeout_sec"]),
+        )
+        smoke_case = _finalize_smoke_case(test_case, response)
+        smoke_case["method"] = test_case["method"]
+        smoke_case["url"] = url
+        case_results.append(smoke_case)
+
+    passed = sum(1 for item in case_results if item.get("status") == STATUS_PASSED)
+    failed = sum(1 for item in case_results if item.get("status") == STATUS_FAILED)
+    skipped = sum(1 for item in case_results if item.get("status") == STATUS_SKIPPED)
+    status = STATUS_FAILED if failed else (STATUS_SKIPPED if passed == 0 else STATUS_PASSED)
+    return stage_result(
+        status,
+        total=len(case_results),
+        passed=passed,
+        failed=failed,
+        skipped=skipped,
+        suite_files=suite_files,
+        cases=case_results,
+        duration_sec=round(time.monotonic() - started, 3),
     )
 
 
@@ -413,6 +542,7 @@ def _run_one_case(
                     for item, cards, command in zip(services, service_cards, service_commands, strict=False)
                 ],
             )
+            result["smoke"] = _run_smoke_suite(case, service, args.model_root, dry_run=True)
             return result
 
         workdir = expand_text(case.get("runtime", {}).get("workdir", "."), env)
@@ -480,12 +610,14 @@ def _run_one_case(
         port = int(service.get("port", 8000))
         smoke = case.get("tests", {}).get("smoke") or {}
         if smoke.get("enabled", True):
-            endpoint = smoke.get("endpoint", "/v1/completions")
-            url = f"http://{host}:{port}{endpoint}"
-            expected = int(smoke.get("expected_http_status", 200))
-            result["smoke"] = _post_json(url, smoke.get("payload") or {}, expected)
+            result["smoke"] = _run_smoke_suite(case, service, args.model_root)
             if result["smoke"]["status"] != STATUS_PASSED:
-                _mark_failed(result, "smoke", f"smoke HTTP status {result['smoke'].get('http_status')}")
+                failed_case = next(
+                    (item for item in result["smoke"].get("cases", []) if item.get("status") == STATUS_FAILED),
+                    {},
+                )
+                reason = failed_case.get("failure_reason") or "smoke suite failed"
+                _mark_failed(result, "smoke", str(reason))
                 return result
 
         benchmark = case.get("tests", {}).get("benchmark") or {}

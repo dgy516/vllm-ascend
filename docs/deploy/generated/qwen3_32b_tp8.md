@@ -40,7 +40,7 @@ Single-service Qwen3 32B deployment case for 8-card Ascend nightly validation.
 
 - Service `qwen3-32b` runs as `vllm-serve` on `127.0.0.1:8113` with role `serve`.
 
-Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/with_runtime_allocation.py` 在宿主机分配；容器内 runner 再按 `requirements.hardware.card_count=8` 为本 case 分配子卡集和端口。
+Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/run_runtime_container.py` 在宿主机分配并持锁；容器内 runner 再按 `requirements.hardware.card_count=8` 为本 case 分配子卡集和端口。
 
 ## 5. 环境变量
 
@@ -63,32 +63,7 @@ vllm serve Qwen/Qwen3-32B --served-model-name qwen3-32b-tp8 --host 127.0.0.1 --p
 ### Docker runtime 示例
 
 ```bash
-docker run --rm \
-  --name vllm-ascend-ci-qwen3-32b-tp8 \
-  --network host \
-  --ipc host \
-  --shm-size=1g \
-  --device /dev/davinci0 \
-  --device /dev/davinci_manager \
-  --device /dev/devmm_svm \
-  --device /dev/hisi_hdc \
-  ${ASCEND_DOCKER_DEVICE_ARGS} \
-  -v /usr/local/dcmi:/usr/local/dcmi \
-  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-  -v /etc/ascend_install.info:/etc/ascend_install.info \
-  -v /root/.cache:/root/.cache \
-  -e ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES} \
-  -e VLLM_CI_ALLOCATED_PORTS=${VLLM_CI_ALLOCATED_PORTS} \
-  -e MODEL_ROOT=${MODEL_ROOT} \
-  -v ${WORKSPACE}/.ci:/home/ma-user/AscendCloud/jenkins/.ci:ro \
-  -v ${WORKSPACE}/reports:/home/ma-user/AscendCloud/jenkins/reports:rw \
-  -v ${WORKSPACE}/logs:/home/ma-user/AscendCloud/jenkins/logs:rw \
-  -v ${MODEL_ROOT}:${MODEL_ROOT}:ro \
-  -w /home/ma-user/AscendCloud/jenkins \
-  ${ASCEND_DOCKER_IMAGE} \
-  vllm serve Qwen/Qwen3-32B --served-model-name qwen3-32b-tp8 --host 127.0.0.1 --port 8113 --tensor-parallel-size 8 --max-model-len 32768 --max-num-batched-tokens 32768 --max-num-seqs 16 --gpu-memory-utilization 0.9 --trust-remote-code --no-enable-prefix-caching
+docker run --rm --name 'vllm-ascend-ci-${BUILD_TAG}' --network host --ipc host --shm-size=1g --device /dev/davinci${ASCEND_CARD_ID} --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info -v /etc/ascend_install.info:/etc/ascend_install.info -v /root/.cache:/root/.cache -v '${WORKSPACE}/.ci:/home/ma-user/AscendCloud/jenkins/.ci:ro' -v '${WORKSPACE}/reports:/home/ma-user/AscendCloud/jenkins/reports:rw' -v '${WORKSPACE}/logs:/home/ma-user/AscendCloud/jenkins/logs:rw' -e 'MODEL_ROOT=${MODEL_ROOT}' -v '${MODEL_ROOT}:${MODEL_ROOT}:ro' -e ASCEND_RT_VISIBLE_DEVICES=${ASCEND_CARD_ID} -e VLLM_CI_ALLOCATED_PORTS=${VLLM_PORT} -e VLLM_CI_ALLOCATION_JSON=reports/runtime_container_allocation.json -e 'VLLM_CI_CONTAINER_NAME=vllm-ascend-ci-${BUILD_TAG}' -e PYTHONUNBUFFERED=1 -w /home/ma-user/AscendCloud/jenkins '${ASCEND_DOCKER_IMAGE}' bash -lc 'cd /home/ma-user/AscendCloud/jenkins && python3 .ci/scripts/run_deploy_cases.py --case-list reports/selected_cases.txt --allocation-json reports/runtime_container_allocation.json --output-dir reports/nightly/case_results --logs-dir logs/deploy --model-root '"'"'${MODEL_ROOT}'"'"' --parallelism '"'"'${RUNTIME_PARALLELISM}'"'"' --continue-on-error'
 ```
 
 Docker 配置：
@@ -155,8 +130,8 @@ curl -sS -X POST http://127.0.0.1:8113/v1/completions \
   -H 'Content-Type: application/json' \
   -d '{
   "model": "qwen3-32b-tp8",
-  "prompt": "The future of AI is",
-  "max_tokens": 16,
+  "prompt": "San Francisco is a",
+  "max_tokens": 8,
   "temperature": 0
 }' | python3 -m json.tool
 ```

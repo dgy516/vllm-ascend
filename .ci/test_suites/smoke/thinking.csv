@@ -1,0 +1,2 @@
+id,enabled,mode,method,endpoint,model,prompt,messages_json,max_tokens,temperature,extra_json,expected_http_status,min_output_tokens,response_contains,response_not_contains,timeout_sec,description
+thinking_chat_reasoning,true,chat,POST,/v1/chat/completions,${served_model_name},,"[{""role"":""user"",""content"":""Think step by step and answer with the final number: 1+1.""}]",64,0,"{""chat_template_kwargs"":{""enable_thinking"":true}}",200,1,reasoning_content,,180,Verify thinking-capable models expose reasoning output when thinking is enabled

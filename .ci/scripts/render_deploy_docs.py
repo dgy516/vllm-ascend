@@ -12,7 +12,6 @@ from typing import Any
 import yaml
 from deploy_case_lib import (
     ALLOWED_LEVELS,
-    CONTAINER_WORKSPACE,
     build_vllm_serve_command,
     case_card_count,
     case_level,
@@ -22,7 +21,9 @@ from deploy_case_lib import (
     expand_case_paths,
     first_service,
     load_case,
+    served_model_name,
 )
+from run_runtime_container import docker_command_example
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,18 +80,6 @@ def _parameter_table(args: list[str]) -> str:
     return "\n".join(rows)
 
 
-def _docker_mounts(mounts: list[dict[str, Any]]) -> str:
-    if not mounts:
-        return "# no explicit mounts"
-    lines: list[str] = []
-    for mount in mounts:
-        source = mount.get("source", "")
-        target = mount.get("target", "")
-        mode = mount.get("mode", "rw")
-        lines.append(f"-v {source}:{target}:{mode}")
-    return " \\\n  ".join(lines)
-
-
 def _render_template(template_text: str, context: dict[str, str]) -> str:
     try:
         from jinja2 import Template
@@ -118,11 +107,18 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
     port = service.get("port", 8000)
     readiness = case.get("checks", {}).get("readiness", {})
     readiness_path = readiness.get("path", "/health")
-    smoke = case.get("tests", {}).get("smoke", {})
     benchmark = case.get("tests", {}).get("benchmark", {})
     accuracy = case.get("tests", {}).get("accuracy", {})
-    payload = json.dumps(smoke.get("payload", {}), indent=2, ensure_ascii=False)
-    smoke_endpoint = smoke.get("endpoint", "/v1/completions")
+    smoke_payload = json.dumps(
+        {
+            "model": served_model_name(service),
+            "prompt": "San Francisco is a",
+            "max_tokens": 8,
+            "temperature": 0,
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
 
     benchmark_command = "# benchmark disabled"
     if benchmark.get("enabled") and benchmark.get("command"):
@@ -136,31 +132,7 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
         f"- Service `{service.get('name')}` runs as `{service.get('type')}` on "
         f"`{host}:{port}` with role `{service.get('role')}`."
     )
-    docker_command = (
-        "docker run --rm \\\n"
-        f"  --name vllm-ascend-ci-{case_name(case)} \\\n"
-        "  --network host \\\n"
-        "  --ipc host \\\n"
-        f"  --shm-size={docker.get('shm_size', '1g')} \\\n"
-        "  --device /dev/davinci0 \\\n"
-        "  --device /dev/davinci_manager \\\n"
-        "  --device /dev/devmm_svm \\\n"
-        "  --device /dev/hisi_hdc \\\n"
-        "  ${ASCEND_DOCKER_DEVICE_ARGS} \\\n"
-        "  -v /usr/local/dcmi:/usr/local/dcmi \\\n"
-        "  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \\\n"
-        "  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \\\n"
-        "  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \\\n"
-        "  -v /etc/ascend_install.info:/etc/ascend_install.info \\\n"
-        "  -v /root/.cache:/root/.cache \\\n"
-        "  -e ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES} \\\n"
-        "  -e VLLM_CI_ALLOCATED_PORTS=${VLLM_CI_ALLOCATED_PORTS} \\\n"
-        "  -e MODEL_ROOT=${MODEL_ROOT} \\\n"
-        f"  {_docker_mounts(docker.get('mounts') or [])} \\\n"
-        f"  -w {CONTAINER_WORKSPACE} \\\n"
-        f"  {docker.get('image', '${ASCEND_DOCKER_IMAGE}')} \\\n"
-        f"  {serve_shell}"
-    )
+    docker_command = docker_command_example()
 
     return {
         "generated_warning": str(doc.get("generated_warning", "")),
@@ -184,9 +156,9 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
         "vllm_config": yaml.safe_dump(vllm, allow_unicode=True, sort_keys=False).rstrip(),
         "readiness_command": f"curl -fsS http://{host}:{port}{readiness_path}",
         "smoke_command": (
-            f"curl -sS -X {smoke.get('method', 'POST')} http://{host}:{port}{smoke_endpoint} \\\n"
+            f"curl -sS -X POST http://{host}:{port}/v1/completions \\\n"
             "  -H 'Content-Type: application/json' \\\n"
-            f"  -d {shlex.quote(payload)} | python3 -m json.tool"
+            f"  -d {shlex.quote(smoke_payload)} | python3 -m json.tool"
         ),
         "benchmark_command": benchmark_command,
         "accuracy_command": accuracy_command,

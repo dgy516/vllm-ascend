@@ -97,14 +97,10 @@ checks:
 tests:
   smoke:
     enabled: true
-    endpoint: /v1/completions
-    method: POST
-    expected_http_status: 200
-    payload:
-      model: qwen25-05b-static
-      prompt: "San Francisco is a"
-      max_tokens: 8
-      temperature: 0
+    suites:
+      include_common: true
+      capabilities: []
+      extra_suite_files: []
   benchmark:
     enabled: false
     command: []

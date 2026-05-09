@@ -106,14 +106,10 @@ checks:
 tests:
   smoke:
     enabled: true
-    endpoint: /v1/completions
-    method: POST
-    expected_http_status: 200
-    payload:
-      model: qwen3-32b-tp8
-      prompt: "The future of AI is"
-      max_tokens: 16
-      temperature: 0
+    suites:
+      include_common: true
+      capabilities: []
+      extra_suite_files: []
   benchmark:
     enabled: false
     command:

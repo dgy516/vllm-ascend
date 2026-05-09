@@ -39,10 +39,11 @@ def main() -> int:
     results = load_case_results(args.input)
     failures = 0
     skipped = 0
+    tests = 0
     suite = ET.Element(
         "testsuite",
         name="vllm-ascend-deploy-cases",
-        tests=str(len(results) * len(STAGES)),
+        tests="0",
         failures="0",
         skipped="0",
     )
@@ -68,7 +69,31 @@ def main() -> int:
                 skipped += 1
                 reason = stage_payload.get("reason") or "skipped"
                 ET.SubElement(testcase, "skipped", message=str(reason))
+            tests += 1
 
+        smoke_payload = case.get("smoke") if isinstance(case.get("smoke"), dict) else {}
+        for smoke_case in smoke_payload.get("cases", []) if isinstance(smoke_payload.get("cases"), list) else []:
+            smoke_id = str(smoke_case.get("id", "unknown"))
+            status = str(smoke_case.get("status", STATUS_SKIPPED))
+            testcase = ET.SubElement(
+                suite,
+                "testcase",
+                classname=case_name,
+                name=f"{case_name}.smoke.{smoke_id}",
+                time=str(smoke_case.get("duration_sec", 0)),
+            )
+            if status == STATUS_FAILED:
+                failures += 1
+                reason = smoke_case.get("failure_reason") or "smoke test failed"
+                failure = ET.SubElement(testcase, "failure", message=str(reason))
+                failure.text = str(reason)
+            elif status == STATUS_SKIPPED:
+                skipped += 1
+                reason = smoke_case.get("reason") or "skipped"
+                ET.SubElement(testcase, "skipped", message=str(reason))
+            tests += 1
+
+    suite.set("tests", str(tests))
     suite.set("failures", str(failures))
     suite.set("skipped", str(skipped))
     output = Path(args.output)

@@ -13,6 +13,8 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
@@ -210,13 +212,24 @@ def _allocation_payload(args: argparse.Namespace, cards: list[int], ports: list[
     }
 
 
-def main() -> int:
-    args = parse_args()
+@contextmanager
+def allocate_runtime_resources(args: argparse.Namespace) -> Iterator[dict[str, Any]]:
+    """Allocate cards and ports, holding locks until the context exits."""
+
     handles: list[TextIO] = []
     try:
         cards, ports, handles = _allocate(args)
-        payload = _allocation_payload(args, cards, ports)
+        yield _allocation_payload(args, cards, ports)
+    finally:
+        _release(handles)
+
+
+def main() -> int:
+    args = parse_args()
+    with allocate_runtime_resources(args) as payload:
         write_json(args.output, payload)
+        cards = payload["cards"]
+        ports = payload["ports"]
         cards_text = ",".join(str(card) for card in cards)
         ports_text = ",".join(str(port) for port in ports)
         print(f"ASCEND_RT_VISIBLE_DEVICES={cards_text}", flush=True)
@@ -237,8 +250,6 @@ def main() -> int:
             }
         )
         return subprocess.run(args.command, env=child_env, check=False).returncode
-    finally:
-        _release(handles)
 
 
 if __name__ == "__main__":

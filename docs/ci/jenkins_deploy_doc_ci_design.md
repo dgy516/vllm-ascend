@@ -142,12 +142,18 @@ repo-root/
       render_deploy_docs.py
       select_deploy_cases.py
       static_validate_cases.py
+      run_runtime_container.py
       run_deploy_cases.py
       generate_junit_report.py
       generate_nightly_report.py
       compare_benchmark.py
       collect_env.py
       cleanup_processes.sh
+
+    test_suites/
+      smoke/
+        common.csv
+        thinking.csv
 
     docker/
       Dockerfile.ci
@@ -276,10 +282,11 @@ ASCEND_LOCK_LABEL=ascend-runtime
 第一版采用“单 runtime 容器 + 容器内卡级调度”作为默认资源模型：
 
 1. 一个 Jenkins runtime build 在目标 Ascend 节点上只启动一个 Docker 容器。
-2. `.ci/scripts/with_runtime_allocation.py` 在宿主机用 file lock 为整个容器分配卡池和端口池。
-3. 容器内 `.ci/scripts/run_deploy_cases.py` 根据 `requirements.hardware.card_count` 为每个 case 分配子卡集和端口。
-4. A2/A3 都不在同一节点上启动多个 Ascend workload 容器；多个 case 在同一个容器内并发。
-5. 8/16 卡大模型 case 会等待足够卡，失败后写入 JSON/JUnit/HTML 报告并继续汇总其他 case。
+2. Jenkins 只调用一次 `.ci/scripts/run_runtime_container.py`。
+3. `.ci/scripts/run_runtime_container.py` 在宿主机用 file lock 为整个容器分配卡池和端口池，并在容器生命周期内持锁。
+4. 容器内 `.ci/scripts/run_deploy_cases.py` 根据 `requirements.hardware.card_count` 为每个 case 分配子卡集和端口。
+5. A2/A3 都不在同一节点上启动多个 Ascend workload 容器；多个 case 在同一个容器内并发。
+6. 8/16 卡大模型 case 会等待足够卡，失败后写入 JSON/JUnit/HTML 报告并继续汇总其他 case。
 
 如果 Jenkins 节点 executor 大于 1，建议配置 `ASCEND_LOCK_LABEL` 做整机外层保护，避免同一节点同时启动两个 runtime 容器。
 
@@ -302,13 +309,13 @@ ASCEND_LOCK_LABEL=ascend-runtime
 
 ```groovy
 lock(label: 'ascend-maintenance', quantity: 1) {
-    sh 'python3 .ci/scripts/with_runtime_allocation.py ... -- docker run ...'
+    sh 'python3 .ci/scripts/run_runtime_container.py ...'
 }
 ```
 
 ### 6.2 Docker 单容器运行约定
 
-Docker runtime 由 Jenkinsfile 在 Ascend agent 上启动，容器参数参考 `docs/source/tutorials/models/Qwen3-30B-A3B.md`。基础 device 和 driver mount 由 Jenkinsfile 生成，`ASCEND_DOCKER_DEVICE_ARGS` 只保留给站点追加额外参数。
+Docker runtime 由 `.ci/scripts/run_runtime_container.py` 在 Ascend agent 上启动，容器参数参考 `docs/source/tutorials/models/Qwen3-30B-A3B.md`。基础 device 和 driver mount 由脚本生成，`ASCEND_DOCKER_DEVICE_ARGS` 只保留给站点追加额外参数；该参数允许为空，空字符串表示不追加任何额外 Docker 参数。
 
 容器启动约定：
 
@@ -322,7 +329,6 @@ docker run --rm \
   --device /dev/davinci_manager \
   --device /dev/devmm_svm \
   --device /dev/hisi_hdc \
-  ${ASCEND_DOCKER_DEVICE_ARGS} \
   -v /usr/local/dcmi:/usr/local/dcmi \
   -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
   -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
@@ -338,10 +344,12 @@ docker run --rm \
   -v ${MODEL_ROOT}:${MODEL_ROOT}:ro \
   -w /home/ma-user/AscendCloud/jenkins \
   ${ASCEND_DOCKER_IMAGE} \
-  python3 .ci/scripts/run_deploy_cases.py --parallelism ${RUNTIME_PARALLELISM} ...
+  bash -lc 'cd /home/ma-user/AscendCloud/jenkins && python3 .ci/scripts/run_deploy_cases.py --parallelism ${RUNTIME_PARALLELISM} ...'
 ```
 
-`DRY_RUN_RUNTIME=true` 时 Jenkins 仍会规划 runtime、执行分配 dry-run、生成 per-case dry-run 结果并打印单个 Docker 命令，但不会启动真实容器或模型。
+如果站点需要额外 Docker 参数，可以通过 Jenkins 参数 `ASCEND_DOCKER_DEVICE_ARGS` 注入，例如 `--ulimit memlock=-1:-1`。为空时不会在 `docker run` 中追加占位参数。
+
+`DRY_RUN_RUNTIME=true` 时 Jenkins 仍会规划 runtime、执行分配 dry-run 并通过 `run_runtime_container.py --dry-run --print-command` 打印单个 Docker 命令，但不会启动真实容器或模型。
 
 ---
 
@@ -667,15 +675,11 @@ checks:
 tests:
   smoke:
     enabled: true
-    target_service: server
-    endpoint: /v1/chat/completions
-    payload:
-      model: qwen3-32b
-      messages:
-        - role: user
-          content: "你好，请用一句话介绍你自己。"
-      max_tokens: 32
-      temperature: 0
+    suites:
+      include_common: true
+      capabilities:
+        - thinking
+      extra_suite_files: []
 
   benchmark:
     enabled: true
@@ -703,6 +707,8 @@ tests:
     thresholds:
       min_score: null
 ```
+
+Smoke API 用例不再写入 DeployCase。通用用例放在 `.ci/test_suites/smoke/common.csv`，对所有模型生效；专用能力用例按 capability 拆分，例如 `.ci/test_suites/smoke/thinking.csv` 只对声明 `capabilities: [thinking]` 的 DeployCase 生效。CSV 用例支持正向和负向请求，使用 `expected_http_status` 判定是否通过。
 
 ---
 
@@ -849,9 +855,10 @@ Archive
     
 7. 校验 vllm-serve 类型必须有 vllm.model。
     
-8. 校验 tests.smoke.payload.model 和 served-model-name 一致。
+8. 校验 tests.smoke.suites 选择的 CSV 文件存在、header 合法、id 唯一。
     
-9. 输出校验结果 JSON。
+9. 校验 2xx smoke 用例的 payload.model 和 served-model-name 一致。
+10. 输出校验结果 JSON。
     
 
 输入：
@@ -910,25 +917,37 @@ python3 .ci/scripts/validate_deploy_case.py \
 
 1. 逐个读取 selected case。
     
-2. 启动服务。
+2. 在容器内按卡池和端口池并发调度 case。
     
-3. 等待服务 ready。
+3. 启动一个 case 内的单服务或多服务 vLLM 进程。
     
-4. 执行 smoke。
+4. 等待服务 ready。
     
-5. 执行 benchmark。
+5. 根据 `tests.smoke.suites` 加载 `.ci/test_suites/smoke/*.csv` 并执行正向/负向 smoke 用例。
     
-6. 执行 accuracy。
+6. 执行 benchmark。
     
-7. 收集结果。
+7. 执行 accuracy。
     
-8. 清理服务。
+8. 收集结果。
     
-9. 支持 continue-on-error。
+9. 清理服务。
     
-10. 生成 case result JSON。
+10. 支持 continue-on-error。
     
-11. 最后根据 blocking failure 决定 exit code。
+11. 生成 case result JSON。
+
+### 11.6 run_runtime_container.py
+
+职责：
+
+1. 在宿主机分配容器级卡池和端口池，并在 Docker 生命周期内持锁。
+2. 写出 `reports/runtime_container_allocation.json`。
+3. 生成唯一的 Docker runtime 命令并写入 `reports/runtime_docker_command.sh`。
+4. 追加 Ascend 基础 device、driver mount、`.ci/reports/logs/MODEL_ROOT` mount。
+5. 仅当 `--extra-docker-args` 非空时追加站点额外 Docker 参数。
+6. 通过 `bash -lc` 在容器内执行 `run_deploy_cases.py`。
+7. 支持 `--dry-run` 和 `--print-command`，用于 Jenkins dry-run 和文档排障。
     
 
 关键要求：
@@ -937,7 +956,7 @@ nightly 模式不能 fail-fast。
 
 一个 case 失败后，要继续执行后续 case，最终统一汇总。
 
-### 11.6 generate_junit_report.py
+### 11.7 generate_junit_report.py
 
 职责：
 
@@ -958,7 +977,7 @@ nightly 模式不能 fail-fast。
     - accuracy
         
 
-### 11.7 generate_nightly_report.py
+### 11.8 generate_nightly_report.py
 
 职责：
 
@@ -1683,7 +1702,7 @@ nightly 生成完整报告
 | `ASCEND_LABEL` | Ascend agent label | 例如 `ascend && 8card` |
 | `ASCEND_LOCK_LABEL` | Lockable Resources label | executor 大于 1 时建议配置整机锁 |
 | `ASCEND_DOCKER_IMAGE` | Ascend runtime Docker image | 为空时使用 `REGISTRY/IMAGE_TAG` 推导 |
-| `ASCEND_DOCKER_DEVICE_ARGS` | 额外 Docker 参数 | 基础 Ascend device/mount 已由 Jenkinsfile 生成 |
+| `ASCEND_DOCKER_DEVICE_ARGS` | 可选额外 Docker 参数 | 可为空；基础 Ascend device/mount 已由 `run_runtime_container.py` 生成 |
 | `NPU_LOCK_DIR` | 卡级 file lock 目录 | 默认 `/tmp/vllm-ascend-ci/npu` |
 | `PORT_LOCK_DIR` | 端口 file lock 目录 | 默认 `/tmp/vllm-ascend-ci/ports` |
 | `RUNTIME_PARALLELISM` | 容器内 case 并发数 | `0` 表示 runner 自动并发 |
@@ -1697,8 +1716,7 @@ python3 .ci/scripts/select_deploy_cases.py --cases ".ci/deploy_cases/*.yaml" --l
 python3 .ci/scripts/render_deploy_docs.py --cases ".ci/deploy_cases/*.yaml" --level smoke --output-dir docs/deploy/generated
 python3 .ci/scripts/static_validate_cases.py --case-list reports/selected_cases.txt --output reports/static_validate.json
 python3 .ci/scripts/plan_deploy_shards.py --case-list reports/selected_cases.txt --output reports/runtime_shards.json
-python3 .ci/scripts/with_runtime_allocation.py --dry-run --card-count 0 --port-count 1 --output reports/test_allocation.json
-python3 .ci/scripts/run_deploy_cases.py --case-list reports/selected_cases.txt --allocation-json reports/test_allocation.json --parallelism 0 --dry-run --continue-on-error
+python3 .ci/scripts/run_runtime_container.py --case-list reports/selected_cases.txt --allocation-json reports/test_allocation.json --docker-image '${ASCEND_DOCKER_IMAGE}' --container-name vllm-ascend-ci-dry-run --card-count 0 --port-count 1 --extra-docker-args "" --dry-run --print-command --continue-on-error
 python3 .ci/scripts/generate_junit_report.py --input reports/nightly/case_results --output reports/nightly/junit.xml
 python3 .ci/scripts/generate_nightly_report.py --input reports/nightly/case_results --output reports/nightly/index.html
 ```

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import csv
 import glob
 import json
 import os
@@ -21,6 +22,27 @@ CONTAINER_WORKSPACE = "/home/ma-user/AscendCloud/jenkins"
 STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
+SMOKE_SUITE_DIR = ".ci/test_suites/smoke"
+SMOKE_SUITE_COLUMNS = (
+    "id",
+    "enabled",
+    "mode",
+    "method",
+    "endpoint",
+    "model",
+    "prompt",
+    "messages_json",
+    "max_tokens",
+    "temperature",
+    "extra_json",
+    "expected_http_status",
+    "min_output_tokens",
+    "response_contains",
+    "response_not_contains",
+    "timeout_sec",
+    "description",
+)
+ALLOWED_SMOKE_MODES = {"completion", "chat", "raw"}
 
 
 class DeployCaseError(RuntimeError):
@@ -284,6 +306,331 @@ def command_to_shell(command: list[str]) -> str:
     return " ".join(shlex.quote(str(part)) for part in command)
 
 
+def parse_bool(value: Any, default: bool = True) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise DeployCaseError(f"expected boolean value, got {value!r}")
+
+
+def _as_str_list(value: Any, field_name: str) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, list):
+        raise DeployCaseError(f"{field_name} must be a string or list of strings")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise DeployCaseError(f"{field_name} must contain non-empty strings")
+        result.append(item.strip())
+    return result
+
+
+def _resolve_repo_path(path: str | Path) -> Path:
+    candidate = Path(expand_text(path))
+    if candidate.is_absolute():
+        return candidate
+    return repo_root() / candidate
+
+
+def smoke_enabled(case: dict[str, Any]) -> bool:
+    smoke = case.get("tests", {}).get("smoke") or {}
+    if not isinstance(smoke, dict):
+        return False
+    return parse_bool(smoke.get("enabled"), True)
+
+
+def selected_smoke_suite_files(case: dict[str, Any]) -> list[str]:
+    """Return smoke CSV suite files selected by DeployCase capabilities."""
+
+    if not smoke_enabled(case):
+        return []
+
+    smoke = case.get("tests", {}).get("smoke") or {}
+    suites = smoke.get("suites")
+
+    # Backward compatibility: legacy inline payload-only cases remain runnable
+    # until all downstream inventories migrate to CSV suites.
+    if suites is None and smoke.get("payload") is not None:
+        return []
+
+    if suites is None:
+        suites = {}
+    if not isinstance(suites, dict):
+        raise DeployCaseError(f"{case_name(case)}: tests.smoke.suites must be a mapping")
+
+    files: list[str] = []
+    if parse_bool(suites.get("include_common"), True):
+        files.append(f"{SMOKE_SUITE_DIR}/common.csv")
+
+    for capability in _as_str_list(suites.get("capabilities"), "tests.smoke.suites.capabilities"):
+        files.append(f"{SMOKE_SUITE_DIR}/{safe_slug(capability)}.csv")
+
+    files.extend(_as_str_list(suites.get("extra_suite_files"), "tests.smoke.suites.extra_suite_files"))
+    files.extend(_as_str_list(smoke.get("suite_files"), "tests.smoke.suite_files"))
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in files:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _row_value(row: dict[str, Any], key: str, env: dict[str, str]) -> str:
+    return expand_text((row.get(key) or "").strip(), env)
+
+
+def _parse_json_object(value: str, field_name: str, test_id: str) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise DeployCaseError(f"{test_id}: {field_name} must be valid JSON: {exc}") from None
+    if not isinstance(payload, dict):
+        raise DeployCaseError(f"{test_id}: {field_name} must be a JSON object")
+    return payload
+
+
+def _parse_json_list(value: str, field_name: str, test_id: str) -> list[Any]:
+    if not value:
+        return []
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise DeployCaseError(f"{test_id}: {field_name} must be valid JSON: {exc}") from None
+    if not isinstance(payload, list):
+        raise DeployCaseError(f"{test_id}: {field_name} must be a JSON list")
+    return payload
+
+
+def _parse_optional_int(value: str, field_name: str, test_id: str) -> int | None:
+    if value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise DeployCaseError(f"{test_id}: {field_name} must be an integer") from None
+
+
+def _parse_optional_float(value: str, field_name: str, test_id: str) -> float | None:
+    if value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        raise DeployCaseError(f"{test_id}: {field_name} must be a float") from None
+
+
+def _smoke_template_env(case: dict[str, Any], service: dict[str, Any], model_root: str = "") -> dict[str, str]:
+    return {
+        "served_model_name": served_model_name(service),
+        "case_name": case_name(case),
+        "host": str(service.get("host", "127.0.0.1")),
+        "port": str(service.get("port", 8000)),
+        "model_root": model_root,
+    }
+
+
+def build_smoke_test_case(
+    case: dict[str, Any],
+    row: dict[str, Any],
+    suite_file: str | Path,
+    service: dict[str, Any] | None = None,
+    model_root: str = "",
+) -> dict[str, Any]:
+    service = service or first_service(case)
+    env = _smoke_template_env(case, service, model_root)
+    test_id = _row_value(row, "id", env)
+    if not test_id:
+        raise DeployCaseError(f"{suite_file}: smoke test id is required")
+
+    mode = (_row_value(row, "mode", env) or "completion").lower()
+    if mode not in ALLOWED_SMOKE_MODES:
+        raise DeployCaseError(f"{test_id}: mode must be one of {sorted(ALLOWED_SMOKE_MODES)}")
+
+    enabled = parse_bool(_row_value(row, "enabled", env), True)
+    method = (_row_value(row, "method", env) or "POST").upper()
+    endpoint = _row_value(row, "endpoint", env)
+    if not endpoint:
+        endpoint = "/v1/chat/completions" if mode == "chat" else "/v1/completions"
+
+    expected_http_status = _parse_optional_int(
+        _row_value(row, "expected_http_status", env),
+        "expected_http_status",
+        test_id,
+    )
+    expected_http_status = 200 if expected_http_status is None else expected_http_status
+    timeout_sec = _parse_optional_int(_row_value(row, "timeout_sec", env), "timeout_sec", test_id) or 120
+    min_output_tokens = _parse_optional_int(
+        _row_value(row, "min_output_tokens", env),
+        "min_output_tokens",
+        test_id,
+    )
+    max_tokens = _parse_optional_int(_row_value(row, "max_tokens", env), "max_tokens", test_id)
+    temperature = _parse_optional_float(_row_value(row, "temperature", env), "temperature", test_id)
+    extra_json = _parse_json_object(_row_value(row, "extra_json", env), "extra_json", test_id)
+    model = _row_value(row, "model", env) or served_model_name(service)
+
+    if mode == "raw":
+        payload = dict(extra_json)
+        if model and "model" not in payload:
+            payload["model"] = model
+    elif mode == "chat":
+        messages = _parse_json_list(_row_value(row, "messages_json", env), "messages_json", test_id)
+        if not messages:
+            prompt = _row_value(row, "prompt", env)
+            if not prompt:
+                raise DeployCaseError(f"{test_id}: chat mode requires messages_json or prompt")
+            messages = [{"role": "user", "content": prompt}]
+        payload = {"model": model, "messages": messages}
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+        payload.update(extra_json)
+    else:
+        prompt = _row_value(row, "prompt", env)
+        if not prompt:
+            raise DeployCaseError(f"{test_id}: completion mode requires prompt")
+        payload = {"model": model, "prompt": prompt}
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+        payload.update(extra_json)
+
+    return {
+        "id": test_id,
+        "enabled": enabled,
+        "suite_file": str(suite_file),
+        "mode": mode,
+        "method": method,
+        "endpoint": endpoint,
+        "payload": payload,
+        "expected_http_status": expected_http_status,
+        "min_output_tokens": min_output_tokens,
+        "response_contains": _row_value(row, "response_contains", env),
+        "response_not_contains": _row_value(row, "response_not_contains", env),
+        "timeout_sec": timeout_sec,
+        "description": _row_value(row, "description", env),
+    }
+
+
+def _legacy_smoke_test_case(case: dict[str, Any], service: dict[str, Any]) -> dict[str, Any]:
+    smoke = case.get("tests", {}).get("smoke") or {}
+    return {
+        "id": "legacy-smoke",
+        "enabled": True,
+        "suite_file": "inline-payload",
+        "mode": "raw",
+        "method": str(smoke.get("method", "POST")).upper(),
+        "endpoint": str(smoke.get("endpoint", "/v1/completions")),
+        "payload": smoke.get("payload") or {},
+        "expected_http_status": int(smoke.get("expected_http_status", 200)),
+        "min_output_tokens": None,
+        "response_contains": "",
+        "response_not_contains": "",
+        "timeout_sec": int(smoke.get("timeout_sec", 120)),
+        "description": "legacy inline smoke payload",
+    }
+
+
+def load_smoke_test_cases(
+    case: dict[str, Any],
+    model_root: str = "",
+    service: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if not smoke_enabled(case):
+        return []
+    service = service or first_service(case)
+    suite_files = selected_smoke_suite_files(case)
+    if not suite_files:
+        smoke = case.get("tests", {}).get("smoke") or {}
+        if smoke.get("payload") is not None:
+            return [_legacy_smoke_test_case(case, service)]
+        return []
+
+    tests: list[dict[str, Any]] = []
+    for suite_file in suite_files:
+        suite_path = _resolve_repo_path(suite_file)
+        with suite_path.open(encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                tests.append(build_smoke_test_case(case, row, suite_file, service, model_root))
+    return tests
+
+
+def validate_smoke_suites(case: dict[str, Any], label: str) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not smoke_enabled(case):
+        return errors, warnings
+
+    smoke = case.get("tests", {}).get("smoke") or {}
+    if smoke.get("payload") is not None:
+        warnings.append(f"{label}: tests.smoke.payload is deprecated; use tests.smoke.suites")
+
+    try:
+        suite_files = selected_smoke_suite_files(case)
+    except DeployCaseError as exc:
+        return [f"{label}: {exc}"], warnings
+
+    if not suite_files:
+        if smoke.get("payload") is None:
+            errors.append(f"{label}: tests.smoke.suites selects no CSV suite files")
+        return errors, warnings
+
+    seen_ids: set[str] = set()
+    service = first_service(case)
+    primary_model = served_model_name(service)
+    for suite_file in suite_files:
+        suite_path = _resolve_repo_path(suite_file)
+        if not suite_path.exists():
+            errors.append(f"{label}: smoke suite file does not exist: {suite_file}")
+            continue
+        try:
+            with suite_path.open(encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames or []
+                missing = [column for column in SMOKE_SUITE_COLUMNS if column not in fieldnames]
+                if missing:
+                    errors.append(f"{label}: {suite_file} missing CSV column(s): {missing}")
+                    continue
+                for row in reader:
+                    try:
+                        test_case = build_smoke_test_case(case, row, suite_file, service)
+                    except DeployCaseError as exc:
+                        errors.append(f"{label}: {suite_file}: {exc}")
+                        continue
+                    test_id = str(test_case["id"])
+                    if test_id in seen_ids:
+                        errors.append(f"{label}: duplicate smoke test id: {test_id}")
+                    seen_ids.add(test_id)
+                    if 200 <= int(test_case["expected_http_status"]) < 300:
+                        payload = test_case.get("payload") or {}
+                        payload_model = payload.get("model") if isinstance(payload, dict) else None
+                        if payload_model != primary_model:
+                            errors.append(
+                                f"{label}: {suite_file}:{test_id} payload.model ({payload_model}) "
+                                f"must match served-model-name ({primary_model})"
+                            )
+        except OSError as exc:
+            errors.append(f"{label}: failed to read smoke suite {suite_file}: {exc}")
+
+    return errors, warnings
+
+
 def get_path(data: Any, path: str) -> Any:
     cur = data
     for item in path.split("."):
@@ -456,18 +803,12 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
             errors.append(f"{label}: {exc}")
 
     smoke = case.get("tests", {}).get("smoke") or {}
-    if isinstance(smoke, dict) and smoke.get("enabled", True):
-        payload = smoke.get("payload") or {}
-        if not isinstance(payload, dict):
-            errors.append(f"{label}: tests.smoke.payload must be a mapping")
-        else:
-            payload_model = payload.get("model")
-            primary_model = served_model_name(services[0])
-            if payload_model != primary_model:
-                errors.append(
-                    f"{label}: tests.smoke.payload.model ({payload_model}) "
-                    f"must match served-model-name ({primary_model})"
-                )
+    if not isinstance(smoke, dict):
+        errors.append(f"{label}: tests.smoke must be a mapping")
+    else:
+        suite_errors, suite_warnings = validate_smoke_suites(case, label)
+        errors.extend(suite_errors)
+        warnings.extend(suite_warnings)
 
     return errors, warnings
 

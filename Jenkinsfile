@@ -62,7 +62,7 @@ pipeline {
         string(name: 'ASCEND_LABEL', defaultValue: 'ascend', description: 'Jenkins label for Ascend runtime stages')
         string(name: 'ASCEND_LOCK_LABEL', defaultValue: '', description: 'Optional Lockable Resources label for Ascend hosts')
         string(name: 'ASCEND_DOCKER_IMAGE', defaultValue: '', description: 'Docker image used for Ascend runtime containers')
-        string(name: 'ASCEND_DOCKER_DEVICE_ARGS', defaultValue: '', description: 'Extra site-specific docker run arguments')
+        string(name: 'ASCEND_DOCKER_DEVICE_ARGS', defaultValue: '', description: 'Extra site-specific runtime container arguments')
         string(name: 'NPU_LOCK_DIR', defaultValue: '/tmp/vllm-ascend-ci/npu', description: 'Host-local file lock directory for Ascend cards')
         string(name: 'PORT_LOCK_DIR', defaultValue: '/tmp/vllm-ascend-ci/ports', description: 'Host-local file lock directory for runtime ports')
         string(name: 'RUNTIME_PARALLELISM', defaultValue: '0', description: 'Concurrent cases inside one runtime container; 0 means auto')
@@ -222,100 +222,39 @@ pipeline {
                                         sh '''#!/usr/bin/env bash
                                             set -euo pipefail
                                             mkdir -p reports/nightly/case_results reports/runtime_shards logs/deploy
-                                            benchmark_arg=()
+                                            runtime_args=()
                                             if [ -n "${BENCHMARK_ARG}" ]; then
-                                              benchmark_arg=("${BENCHMARK_ARG}")
+                                              runtime_args+=("${BENCHMARK_ARG}")
+                                            fi
+                                            dry_run_arg=()
+                                            if [ "${DRY_RUN_RUNTIME}" = "true" ]; then
+                                              dry_run_arg=(--dry-run)
                                             fi
 
-                                            if [ "${DRY_RUN_RUNTIME}" = "true" ]; then
-                                              python3 .ci/scripts/with_runtime_allocation.py \
-                                                --dry-run \
-                                                --card-count 0 \
-                                                --port-count "${TOTAL_PORT_COUNT}" \
-                                                --npu-lock-dir "${NPU_LOCK_DIR}" \
-                                                --port-lock-dir "${PORT_LOCK_DIR}" \
-                                                --output "${ALLOCATION_JSON}"
-                                              python3 .ci/scripts/run_deploy_cases.py \
-                                                --case-list reports/selected_cases.txt \
-                                                --allocation-json "${ALLOCATION_JSON}" \
-                                                --output-dir reports/nightly/case_results \
-                                                --logs-dir logs/deploy \
-                                                --model-root "${MODEL_ROOT}" \
-                                                --parallelism "${RUNTIME_PARALLELISM_RESOLVED}" \
-                                                --dry-run \
-                                                --continue-on-error \
-                                                "${benchmark_arg[@]}"
-                                              echo "Docker dry-run:"
-                                              echo "docker run --rm --name ${CONTAINER_NAME} --network host --ipc host --shm-size=1g <allocated /dev/davinci*> --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc ${ASCEND_DOCKER_DEVICE_ARGS} -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info -v /etc/ascend_install.info:/etc/ascend_install.info -v /root/.cache:/root/.cache -v ${WORKSPACE}/.ci:${CONTAINER_WORKSPACE}/.ci:ro -v ${WORKSPACE}/reports:${CONTAINER_WORKSPACE}/reports:rw -v ${WORKSPACE}/logs:${CONTAINER_WORKSPACE}/logs:rw -w ${CONTAINER_WORKSPACE} ${ASCEND_DOCKER_IMAGE_RESOLVED} python3 .ci/scripts/run_deploy_cases.py ..."
-                                            else
-                                              python3 .ci/scripts/with_runtime_allocation.py \
-                                                --card-count 0 \
-                                                --port-count "${TOTAL_PORT_COUNT}" \
-                                                --npu-lock-dir "${NPU_LOCK_DIR}" \
-                                                --port-lock-dir "${PORT_LOCK_DIR}" \
-                                                --output "${ALLOCATION_JSON}" \
-                                                -- bash -lc '
-                                                  set -euo pipefail
-                                                  benchmark_arg=()
-                                                  if [ -n "${BENCHMARK_ARG}" ]; then
-                                                    benchmark_arg=("${BENCHMARK_ARG}")
-                                                  fi
-                                                  device_args=()
-                                                  IFS="," read -ra allocated_cards <<< "${ASCEND_RT_VISIBLE_DEVICES}"
-                                                  for card in "${allocated_cards[@]}"; do
-                                                    if [ -n "${card}" ]; then
-                                                      device_args+=(--device "/dev/davinci${card}")
-                                                    fi
-                                                  done
-                                                  model_args=()
-                                                  if [ -n "${MODEL_ROOT}" ]; then
-                                                    model_args=(-e MODEL_ROOT="${MODEL_ROOT}" -v "${MODEL_ROOT}:${MODEL_ROOT}:ro")
-                                                  fi
-                                                  docker run --rm \
-                                                    --name "${CONTAINER_NAME}" \
-                                                    --network host \
-                                                    --ipc host \
-                                                    --shm-size=1g \
-                                                    "${device_args[@]}" \
-                                                    --device /dev/davinci_manager \
-                                                    --device /dev/devmm_svm \
-                                                    --device /dev/hisi_hdc \
-                                                    ${ASCEND_DOCKER_DEVICE_ARGS} \
-                                                    -v /usr/local/dcmi:/usr/local/dcmi \
-                                                    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-                                                    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-                                                    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-                                                    -v /etc/ascend_install.info:/etc/ascend_install.info \
-                                                    -v /root/.cache:/root/.cache \
-                                                    -v "${WORKSPACE}/.ci:${CONTAINER_WORKSPACE}/.ci:ro" \
-                                                    -v "${WORKSPACE}/reports:${CONTAINER_WORKSPACE}/reports:rw" \
-                                                    -v "${WORKSPACE}/logs:${CONTAINER_WORKSPACE}/logs:rw" \
-                                                    -e ASCEND_RT_VISIBLE_DEVICES \
-                                                    -e VLLM_CI_ALLOCATED_PORTS \
-                                                    -e VLLM_CI_ALLOCATION_JSON="${ALLOCATION_JSON}" \
-                                                    -e VLLM_CI_CONTAINER_NAME="${CONTAINER_NAME}" \
-                                                    -e PYTHONUNBUFFERED=1 \
-                                                    "${model_args[@]}" \
-                                                    -w "${CONTAINER_WORKSPACE}" \
-                                                    "${ASCEND_DOCKER_IMAGE_RESOLVED}" \
-                                                    python3 .ci/scripts/run_deploy_cases.py \
-                                                      --case-list reports/selected_cases.txt \
-                                                      --allocation-json "${ALLOCATION_JSON}" \
-                                                      --output-dir reports/nightly/case_results \
-                                                      --logs-dir logs/deploy \
-                                                      --model-root "${MODEL_ROOT}" \
-                                                      --parallelism "${RUNTIME_PARALLELISM_RESOLVED}" \
-                                                      --continue-on-error \
-                                                      "${benchmark_arg[@]}"
-                                                '
-                                            fi
+                                            python3 .ci/scripts/run_runtime_container.py \
+                                              --case-list reports/selected_cases.txt \
+                                              --allocation-json "${ALLOCATION_JSON}" \
+                                              --docker-image "${ASCEND_DOCKER_IMAGE_RESOLVED}" \
+                                              --container-name "${CONTAINER_NAME}" \
+                                              --workspace "${WORKSPACE}" \
+                                              --model-root "${MODEL_ROOT}" \
+                                              --card-count 0 \
+                                              --port-count "${TOTAL_PORT_COUNT}" \
+                                              --npu-lock-dir "${NPU_LOCK_DIR}" \
+                                              --port-lock-dir "${PORT_LOCK_DIR}" \
+                                              --parallelism "${RUNTIME_PARALLELISM_RESOLVED}" \
+                                              --extra-docker-args "${ASCEND_DOCKER_DEVICE_ARGS}" \
+                                              --print-command \
+                                              --continue-on-error \
+                                              "${dry_run_arg[@]}" \
+                                              "${runtime_args[@]}"
                                         '''
                                     }
                                 }
                             }
                         } finally {
                             sh 'bash .ci/scripts/cleanup_processes.sh logs/deploy || true'
-                            stash name: 'runtime-results', includes: 'reports/nightly/case_results/**/*,logs/**/*,reports/runtime_container_allocation.json', allowEmpty: true
+                            stash name: 'runtime-results', includes: 'reports/nightly/case_results/**/*,logs/**/*,reports/runtime_container_allocation.json,reports/runtime_docker_command.sh', allowEmpty: true
                         }
                     }
                 }

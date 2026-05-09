@@ -40,7 +40,7 @@ Minimal two-card single-service vLLM Ascend smoke case for Jenkins card-level co
 
 - Service `qwen25-smoke` runs as `vllm-serve` on `127.0.0.1:8000` with role `serve`.
 
-Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/with_runtime_allocation.py` 在宿主机分配；容器内 runner 再按 `requirements.hardware.card_count=2` 为本 case 分配子卡集和端口。
+Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/run_runtime_container.py` 在宿主机分配并持锁；容器内 runner 再按 `requirements.hardware.card_count=2` 为本 case 分配子卡集和端口。
 
 ## 5. 环境变量
 
@@ -60,32 +60,7 @@ vllm serve Qwen/Qwen2.5-0.5B-Instruct --served-model-name qwen25-05b-smoke --hos
 ### Docker runtime 示例
 
 ```bash
-docker run --rm \
-  --name vllm-ascend-ci-qwen25-05b-smoke \
-  --network host \
-  --ipc host \
-  --shm-size=1g \
-  --device /dev/davinci0 \
-  --device /dev/davinci_manager \
-  --device /dev/devmm_svm \
-  --device /dev/hisi_hdc \
-  ${ASCEND_DOCKER_DEVICE_ARGS} \
-  -v /usr/local/dcmi:/usr/local/dcmi \
-  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-  -v /etc/ascend_install.info:/etc/ascend_install.info \
-  -v /root/.cache:/root/.cache \
-  -e ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES} \
-  -e VLLM_CI_ALLOCATED_PORTS=${VLLM_CI_ALLOCATED_PORTS} \
-  -e MODEL_ROOT=${MODEL_ROOT} \
-  -v ${WORKSPACE}/.ci:/home/ma-user/AscendCloud/jenkins/.ci:ro \
-  -v ${WORKSPACE}/reports:/home/ma-user/AscendCloud/jenkins/reports:rw \
-  -v ${WORKSPACE}/logs:/home/ma-user/AscendCloud/jenkins/logs:rw \
-  -v ${MODEL_ROOT}:${MODEL_ROOT}:ro \
-  -w /home/ma-user/AscendCloud/jenkins \
-  ${ASCEND_DOCKER_IMAGE} \
-  vllm serve Qwen/Qwen2.5-0.5B-Instruct --served-model-name qwen25-05b-smoke --host 127.0.0.1 --port 8000 --tensor-parallel-size 2 --max-model-len 2048 --max-num-batched-tokens 2048 --trust-remote-code
+docker run --rm --name 'vllm-ascend-ci-${BUILD_TAG}' --network host --ipc host --shm-size=1g --device /dev/davinci${ASCEND_CARD_ID} --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info -v /etc/ascend_install.info:/etc/ascend_install.info -v /root/.cache:/root/.cache -v '${WORKSPACE}/.ci:/home/ma-user/AscendCloud/jenkins/.ci:ro' -v '${WORKSPACE}/reports:/home/ma-user/AscendCloud/jenkins/reports:rw' -v '${WORKSPACE}/logs:/home/ma-user/AscendCloud/jenkins/logs:rw' -e 'MODEL_ROOT=${MODEL_ROOT}' -v '${MODEL_ROOT}:${MODEL_ROOT}:ro' -e ASCEND_RT_VISIBLE_DEVICES=${ASCEND_CARD_ID} -e VLLM_CI_ALLOCATED_PORTS=${VLLM_PORT} -e VLLM_CI_ALLOCATION_JSON=reports/runtime_container_allocation.json -e 'VLLM_CI_CONTAINER_NAME=vllm-ascend-ci-${BUILD_TAG}' -e PYTHONUNBUFFERED=1 -w /home/ma-user/AscendCloud/jenkins '${ASCEND_DOCKER_IMAGE}' bash -lc 'cd /home/ma-user/AscendCloud/jenkins && python3 .ci/scripts/run_deploy_cases.py --case-list reports/selected_cases.txt --allocation-json reports/runtime_container_allocation.json --output-dir reports/nightly/case_results --logs-dir logs/deploy --model-root '"'"'${MODEL_ROOT}'"'"' --parallelism '"'"'${RUNTIME_PARALLELISM}'"'"' --continue-on-error'
 ```
 
 Docker 配置：

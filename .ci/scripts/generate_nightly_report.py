@@ -101,6 +101,29 @@ def _stage_rows(results: list[dict[str, Any]], stage: str, columns: list[str]) -
     return "\n".join(rows)
 
 
+def _smoke_rows(results: list[dict[str, Any]]) -> str:
+    rows = []
+    for item in results:
+        smoke = item.get("smoke") if isinstance(item.get("smoke"), dict) else {}
+        cases = smoke.get("cases") if isinstance(smoke.get("cases"), list) else []
+        for smoke_case in cases:
+            status = str(smoke_case.get("status", STATUS_SKIPPED))
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(item.get('case_name', '')))}</td>"
+                f"<td>{html.escape(str(smoke_case.get('suite_file', '')))}</td>"
+                f"<td>{html.escape(str(smoke_case.get('id', '')))}</td>"
+                f"<td><span class=\"{html.escape(status)}\">{html.escape(status)}</span></td>"
+                f"<td>{html.escape(str(smoke_case.get('http_status', '')))}</td>"
+                f"<td>{html.escape(str(smoke_case.get('expected_http_status', '')))}</td>"
+                f"<td>{html.escape(str(smoke_case.get('duration_sec', '')))}</td>"
+                f"<td>{html.escape(str(smoke_case.get('failure_reason') or smoke_case.get('reason') or ''))}</td>"
+                f"<td>{html.escape(str(smoke_case.get('response_preview', '')))}</td>"
+                "</tr>"
+            )
+    return "\n".join(rows)
+
+
 def main() -> int:
     args = parse_args()
     output = Path(args.output)
@@ -172,6 +195,38 @@ def main() -> int:
         ],
         ["case_name", "status", "metrics", "log_file"],
     )
+    smoke_rows = []
+    for item in results:
+        smoke = item.get("smoke") if isinstance(item.get("smoke"), dict) else {}
+        for smoke_case in smoke.get("cases", []) if isinstance(smoke.get("cases"), list) else []:
+            smoke_rows.append(
+                {
+                    "case_name": item.get("case_name", ""),
+                    "suite_file": smoke_case.get("suite_file", ""),
+                    "id": smoke_case.get("id", ""),
+                    "status": smoke_case.get("status", ""),
+                    "http_status": smoke_case.get("http_status", ""),
+                    "expected_http_status": smoke_case.get("expected_http_status", ""),
+                    "duration_sec": smoke_case.get("duration_sec", ""),
+                    "failure_reason": smoke_case.get("failure_reason") or smoke_case.get("reason") or "",
+                    "description": smoke_case.get("description", ""),
+                }
+            )
+    _write_csv(
+        out_dir / "smoke.csv",
+        smoke_rows,
+        [
+            "case_name",
+            "suite_file",
+            "id",
+            "status",
+            "http_status",
+            "expected_http_status",
+            "duration_sec",
+            "failure_reason",
+            "description",
+        ],
+    )
     _write_csv(
         out_dir / "accuracy.csv",
         [
@@ -200,6 +255,7 @@ def main() -> int:
         "failed": str(failed),
         "skipped": str(skipped),
         "case_rows": _case_rows(results),
+        "smoke_rows": _smoke_rows(results),
         "benchmark_rows": _stage_rows(results, "benchmark", ["metrics", "log_file"]),
         "accuracy_rows": _stage_rows(results, "accuracy", ["mode", "score"]),
         "environment_json": html.escape(json.dumps(environment, indent=2, ensure_ascii=False)),

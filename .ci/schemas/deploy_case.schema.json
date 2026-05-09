@@ -91,6 +91,29 @@
         "type": "object",
         "required": ["name", "role", "type", "host", "port", "log_file", "vllm"]
       }
+    },
+    "tests": {
+      "type": "object",
+      "required": ["smoke", "benchmark", "accuracy"],
+      "properties": {
+        "smoke": {
+          "type": "object",
+          "required": ["enabled"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "suites": {
+              "type": "object",
+              "properties": {
+                "include_common": {"type": "boolean"},
+                "capabilities": {"type": "array", "items": {"type": "string"}},
+                "extra_suite_files": {"type": "array", "items": {"type": "string"}}
+              }
+            }
+          }
+        },
+        "benchmark": {"type": "object"},
+        "accuracy": {"type": "object"}
+      }
     }
   }
 }
