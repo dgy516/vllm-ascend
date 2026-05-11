@@ -184,10 +184,10 @@ pipeline {
             steps {
                 script {
                     node(params.ASCEND_LABEL) {
-                        checkout scm
                         unstash 'selected-cases'
                         unstash 'runtime-plan'
-                        def plan = new JsonSlurperClassic().parseText(readFile('reports/runtime_shards.json'))
+                        def jsonText = readFile('reports/runtime_shards.json')
+                        def plan = new groovy.json.JsonSlurperClassic().parseText(jsonText)
                         if ((plan.shards ?: []).isEmpty()) {
                             error('RUN_ASCEND=true but no runtime cases were planned.')
                         }
