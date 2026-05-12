@@ -38,7 +38,7 @@ Single-service Qwen3 32B deployment case for 8-card Ascend nightly validation.
 
 ## 4. 部署拓扑
 
-- Service `qwen3-32b` runs as `vllm-serve` on `127.0.0.1:8113` with role `serve`.
+- Service `qwen3-32b` runs as `vllm-serve` on `127.0.0.1:8113` with role `serve` and card_count=`8`.
 
 Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/run_runtime_container.py` 在宿主机分配并持锁；容器内 runner 再按 `requirements.hardware.card_count=8` 为本 case 分配子卡集和端口。
 
@@ -57,6 +57,7 @@ export HCCL_OP_EXPANSION_MODE=AIV
 ### vLLM 命令
 
 ```bash
+# qwen3-32b (serve)
 vllm serve Qwen/Qwen3-32B --served-model-name qwen3-32b-tp8 --host 127.0.0.1 --port 8113 --tensor-parallel-size 8 --max-model-len 32768 --max-num-batched-tokens 32768 --max-num-seqs 16 --gpu-memory-utilization 0.9 --trust-remote-code --no-enable-prefix-caching
 ```
 

@@ -351,6 +351,18 @@ docker run --rm \
 
 `DRY_RUN_RUNTIME=true` 时 Jenkins 仍会规划 runtime、执行分配 dry-run 并通过 `run_runtime_container.py --dry-run --print-command` 打印单个 Docker 命令，但不会启动真实容器或模型。
 
+### 6.3 PD 多服务运行约定
+
+PD 分离不再按“一个服务一个 Jenkins task”拆分。一个 DeployCase 表达一个完整拓扑，runner 在同一个 Docker 容器内启动多个进程：
+
+- `type: vllm-serve`：启动真实 vLLM worker，例如 prefill、decode、prefill-decode。
+- `type: command`：启动 proxy/router 等控制面进程，例如 `.ci/scripts/pd_proxy.py`。
+- `services[].resources.card_count` 表达单个服务需要的卡数；proxy 可以设置为 `0`。
+- `services[].resources.extra_port_count` 表达 KV transfer 等附加端口需求；runner 会和 HTTP 服务端口一起分配，避免并发 case 冲突。
+- `metadata.levels` 可让同一个复杂 case 同时进入 `static` 和 `smoke` 选择，避免维护两份重复 YAML。
+
+当前 Qwen2.5-VL-7B-Instruct 使用 P/D 形态作为 PR/smoke 示例：proxy 接收 OpenAI chat 请求，先请求 prefiller 获取 `kv_transfer_params`，再把原请求转发给 decoder。后续多 P 多 D 拓扑仍沿用同一个 `services[]` 模型。
+
 ---
 
 ## 7. CI 模式设计
@@ -1680,7 +1692,7 @@ nightly 生成完整报告
 
 1. CI 内部实现位于 `.ci/`，根目录只保留 `Jenkinsfile`。
 2. 默认 `RUN_ASCEND=false`，静态和 PR 流程只做 YAML 校验、文档生成、case 选择和静态 CLI 校验。
-3. 第一版 runner 只执行单服务 `vllm-serve`；PD、多机和多服务拓扑保留在 schema/配置结构中，后续再接执行器。
+3. Runner 支持单服务 `vllm-serve`，也支持同一容器内的多服务 `vllm-serve` + `command` 拓扑；Qwen2.5-VL-7B-Instruct P/D 是当前 PR/smoke 示例。
 4. Accuracy 只支持 `execute_only`，命令返回 0 即通过，报告中 `score=N/A`。
 5. Runtime 产物统一写入 `reports/` 和 `logs/`，两者已加入 `.gitignore`。
 6. `static`、`smoke`、`nightly` 至少各有一个 case，保证 Jenkins 默认 `CASE_LEVEL=auto` 不会选空。

@@ -17,6 +17,7 @@ from deploy_case_lib import (
     load_case,
     read_case_list,
     safe_slug,
+    service_extra_port_count,
     write_json,
 )
 
@@ -34,7 +35,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _port_count(case: dict[str, Any]) -> int:
-    return len(case.get("services") or [])
+    services = [item for item in case.get("services", []) if isinstance(item, dict)]
+    return len(services) + sum(service_extra_port_count(item) for item in services)
 
 
 def main() -> int:

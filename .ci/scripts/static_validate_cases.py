@@ -10,6 +10,7 @@ from typing import Any
 from deploy_case_lib import (
     ALLOWED_SOCS,
     CONTAINER_WORKSPACE,
+    build_command_service_command,
     build_vllm_serve_command,
     case_card_count,
     case_name,
@@ -176,13 +177,16 @@ def main() -> int:
             errors, warnings = validate_case(case, path)
             commands = []
             for service in case.get("services") or [first_service(case)]:
-                if service.get("type") != "vllm-serve":
-                    errors.append(f"{case_name(case)}: only vllm-serve is supported in MVP")
+                if service.get("type") == "vllm-serve":
+                    command = build_vllm_serve_command(case, service, {"MODEL_ROOT": args.model_root})
+                    errors.extend(_validate_flag_types(command))
+                    errors.extend(_validate_runtime_resources(case, command))
+                elif service.get("type") == "command":
+                    command = build_command_service_command(case, service, {"MODEL_ROOT": args.model_root})
+                else:
+                    errors.append(f"{case_name(case)}: unsupported service type {service.get('type')}")
                     continue
-                command = build_vllm_serve_command(case, service, {"MODEL_ROOT": args.model_root})
                 commands.append(command_to_shell(command))
-                errors.extend(_validate_flag_types(command))
-                errors.extend(_validate_runtime_resources(case, command))
             entry["command"] = "\n".join(commands)
             if args.check_model_path:
                 errors.extend(_check_model_path(case, args.model_root))

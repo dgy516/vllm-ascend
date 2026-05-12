@@ -24,6 +24,7 @@ from deploy_case_lib import (
     allocation_cards,
     allocation_ports,
     apply_allocation,
+    build_command_service_command,
     build_vllm_serve_command,
     case_card_count,
     case_level,
@@ -37,6 +38,7 @@ from deploy_case_lib import (
     read_json,
     safe_slug,
     service_card_count,
+    service_extra_port_count,
     set_cli_flag_value,
     stage_result,
     write_json,
@@ -468,22 +470,45 @@ def _service_card_allocations(
     cards: list[int],
 ) -> list[list[int]]:
     if len(services) == 1:
+        count = service_card_count(services[0])
+        if count == 0:
+            return [[]]
         return [cards]
 
     allocations: list[list[int]] = []
     offset = 0
     for service in services:
         count = service_card_count(service)
+        if count is None and service.get("type") == "command":
+            count = 0
         if count is None:
             raise ValueError(f"{case_name(case)}: service {service.get('name')} requires resources.card_count")
-        if count < 1:
-            raise ValueError(f"{case_name(case)}: service {service.get('name')} resources.card_count must be >= 1")
+        minimum_count = 0 if service.get("type") == "command" else 1
+        if count < minimum_count:
+            raise ValueError(
+                f"{case_name(case)}: service {service.get('name')} resources.card_count must be >= {minimum_count}"
+            )
         next_offset = offset + count
         if next_offset > len(cards):
             raise ValueError(f"{case_name(case)}: service card counts exceed allocated cards {cards}")
         allocations.append(cards[offset:next_offset])
         offset = next_offset
     return allocations
+
+
+def _build_service_command(case: dict[str, Any], service: dict[str, Any], model_root: str) -> list[str]:
+    if service.get("type") == "vllm-serve":
+        return build_vllm_serve_command(case, service, {"MODEL_ROOT": model_root})
+    if service.get("type") == "command":
+        return build_command_service_command(case, service, {"MODEL_ROOT": model_root})
+    raise ValueError(f"{case_name(case)}: unsupported service type {service.get('type')}")
+
+
+def _service_readiness(case: dict[str, Any], service: dict[str, Any]) -> dict[str, Any]:
+    service_readiness = service.get("readiness")
+    if isinstance(service_readiness, dict):
+        return service_readiness
+    return case.get("checks", {}).get("readiness") or {}
 
 
 def _run_one_case(
@@ -508,9 +533,9 @@ def _run_one_case(
     processes: list[subprocess.Popen[Any]] = []
 
     try:
-        if not services or any(item.get("type") != "vllm-serve" for item in services):
+        if not services or any(item.get("type") not in {"vllm-serve", "command"} for item in services):
             result["status"] = STATUS_SKIPPED
-            reason = "runner supports vllm-serve services only"
+            reason = "runner supports vllm-serve and command services only"
             result["failure_stage"] = "topology"
             result["failure_reason"] = reason
             result["startup"] = stage_result(STATUS_SKIPPED, reason=reason)
@@ -518,9 +543,7 @@ def _run_one_case(
 
         env = _case_env(case, args.model_root)
         service_cards = _service_card_allocations(case, services, allocation_cards(allocation))
-        service_commands = [
-            build_vllm_serve_command(case, item, {"MODEL_ROOT": args.model_root}) for item in services
-        ]
+        service_commands = [_build_service_command(case, item, args.model_root) for item in services]
         result["artifacts"]["serve_command"] = command_to_shell(service_commands[0])
         result["artifacts"]["serve_commands"] = {
             str(item.get("name")): command_to_shell(command)
@@ -555,6 +578,8 @@ def _run_one_case(
             item_env = dict(env)
             if cards:
                 item_env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(str(card) for card in cards)
+            elif service_card_count(item) == 0:
+                item_env["ASCEND_RT_VISIBLE_DEVICES"] = ""
             with item_log_path.open("w", encoding="utf-8") as log_file:
                 log_file.write(f"$ {command_to_shell(command)}\n")
                 process = subprocess.Popen(
@@ -589,7 +614,7 @@ def _run_one_case(
         for item in services:
             host = str(item.get("host", "127.0.0.1"))
             port = int(item.get("port", 8000))
-            item_readiness = _wait_for_readiness(host, port, case.get("checks", {}).get("readiness") or {})
+            item_readiness = _wait_for_readiness(host, port, _service_readiness(case, item))
             item_readiness["service"] = item.get("name")
             readiness_results.append(item_readiness)
         readiness_status = (
@@ -688,8 +713,16 @@ def _allocation_failure_result(case_path: str, args: argparse.Namespace, reason:
     return result
 
 
+def _prepare_output_dir(output_dir: str) -> None:
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    for path in directory.glob("*.json"):
+        path.unlink()
+
+
 def _case_port_count(case: dict[str, Any]) -> int:
-    return len(case.get("services") or [])
+    services = [item for item in case.get("services", []) if isinstance(item, dict)]
+    return len(services) + sum(service_extra_port_count(item) for item in services)
 
 
 def _run_one_case_with_allocator(
@@ -720,6 +753,7 @@ def _run_one_case_with_allocator(
 
 def main() -> int:
     args = parse_args()
+    _prepare_output_dir(args.output_dir)
     paths = read_case_list(args.case_list)
     if not paths:
         print(f"case list is empty: {args.case_list}")

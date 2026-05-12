@@ -18,6 +18,7 @@ API_VERSION = "llm-ci/v1"
 KIND = "DeployCase"
 ALLOWED_LEVELS = {"static", "smoke", "nightly", "release", "benchmark"}
 ALLOWED_SOCS = {"A2", "A3", "any"}
+ALLOWED_SERVICE_TYPES = {"vllm-serve", "command"}
 CONTAINER_WORKSPACE = "/home/ma-user/AscendCloud/jenkins"
 STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
@@ -129,9 +130,24 @@ def case_level(case: dict[str, Any]) -> str:
     return str(case.get("metadata", {}).get("level", ""))
 
 
+def case_levels(case: dict[str, Any]) -> set[str]:
+    metadata = case.get("metadata", {})
+    levels = {case_level(case)}
+    extra_levels = metadata.get("levels") or []
+    if isinstance(extra_levels, str):
+        extra_levels = [extra_levels]
+    if isinstance(extra_levels, list):
+        levels.update(str(item) for item in extra_levels if str(item).strip())
+    return {item for item in levels if item}
+
+
 def safe_slug(value: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
     return slug.strip("-") or "case"
+
+
+def template_var_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_").upper()
 
 
 def first_service(case: dict[str, Any]) -> dict[str, Any]:
@@ -145,7 +161,7 @@ def first_service(case: dict[str, Any]) -> dict[str, Any]:
 
 def served_model_name(service: dict[str, Any]) -> str:
     vllm = service.get("vllm") or {}
-    return str(vllm.get("served_model_name") or vllm.get("model") or "")
+    return str(service.get("served_model_name") or vllm.get("served_model_name") or vllm.get("model") or "")
 
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -156,6 +172,27 @@ def runtime_env(case: dict[str, Any]) -> dict[str, str]:
     if not isinstance(env, dict):
         return {}
     return {str(k): str(v) for k, v in env.items()}
+
+
+def service_template_env(case: dict[str, Any], model_root: str = "") -> dict[str, str]:
+    env: dict[str, str] = {}
+    if model_root:
+        env["MODEL_ROOT"] = model_root
+    for service in case.get("services") or []:
+        if not isinstance(service, dict):
+            continue
+        service_name = str(service.get("name") or "")
+        if not service_name:
+            continue
+        prefix = template_var_name(service_name)
+        env[f"SERVICE_{prefix}_HOST"] = str(service.get("host", "127.0.0.1"))
+        env[f"SERVICE_{prefix}_PORT"] = str(service.get("port", 8000))
+        for index, port in enumerate(service_extra_ports(service)):
+            env[f"SERVICE_{prefix}_EXTRA_PORT_{index}"] = str(port)
+        served_name = served_model_name(service)
+        if served_name:
+            env[f"SERVICE_{prefix}_SERVED_MODEL_NAME"] = served_name
+    return env
 
 
 def hardware_config(case: dict[str, Any]) -> dict[str, Any]:
@@ -176,6 +213,31 @@ def service_card_count(service: dict[str, Any]) -> int | None:
         return int(resources["card_count"])
     except (TypeError, ValueError):
         raise DeployCaseError(f"service {service.get('name')}: resources.card_count must be an integer") from None
+
+
+def service_extra_port_count(service: dict[str, Any]) -> int:
+    resources = service.get("resources") or {}
+    if not isinstance(resources, dict):
+        return 0
+    value = resources.get("extra_port_count")
+    if value is None:
+        return 0
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        raise DeployCaseError(f"service {service.get('name')}: resources.extra_port_count must be an integer") from None
+    if count < 0:
+        raise DeployCaseError(f"service {service.get('name')}: resources.extra_port_count must be >= 0")
+    return count
+
+
+def service_extra_ports(service: dict[str, Any]) -> list[int]:
+    if service.get("allocated_extra_ports") is not None:
+        value = service.get("allocated_extra_ports")
+    else:
+        resources = service.get("resources") or {}
+        value = resources.get("extra_ports") if isinstance(resources, dict) else None
+    return _as_int_list(value)
 
 
 def case_card_count(case: dict[str, Any]) -> int:
@@ -257,14 +319,25 @@ def apply_allocation(case: dict[str, Any], allocation: dict[str, Any] | None) ->
     if not ports:
         return
     services = case.get("services") or []
-    if len(ports) < len(services):
+    required_ports = len(services) + sum(
+        service_extra_port_count(service) for service in services if isinstance(service, dict)
+    )
+    if len(ports) < required_ports:
         raise DeployCaseError(
             f"{case_name(case)}: allocation provides {len(ports)} port(s) "
-            f"for {len(services)} service(s)"
+            f"for {len(services)} service(s) and {required_ports - len(services)} extra service port(s)"
         )
     for service, port in zip(services, ports, strict=False):
         if isinstance(service, dict):
             service["port"] = port
+    offset = len(services)
+    for service in services:
+        if not isinstance(service, dict):
+            continue
+        count = service_extra_port_count(service)
+        if count:
+            service["allocated_extra_ports"] = ports[offset : offset + count]
+            offset += count
 
 
 def build_vllm_serve_command(
@@ -275,6 +348,7 @@ def build_vllm_serve_command(
     service = service or first_service(case)
     vllm = service.get("vllm") or {}
     env = runtime_env(case)
+    env.update(service_template_env(case))
     if extra_env:
         env.update({str(k): str(v) for k, v in extra_env.items()})
 
@@ -300,6 +374,22 @@ def build_vllm_serve_command(
         set_cli_flag_value(args, "--served-model-name", served_name)
 
     return ["vllm", "serve", model, *args]
+
+
+def build_command_service_command(
+    case: dict[str, Any],
+    service: dict[str, Any],
+    extra_env: dict[str, str] | None = None,
+) -> list[str]:
+    env = runtime_env(case)
+    env.update(service_template_env(case))
+    if extra_env:
+        env.update({str(k): str(v) for k, v in extra_env.items()})
+
+    raw_command = service.get("command") or []
+    if not isinstance(raw_command, list) or not raw_command:
+        raise DeployCaseError(f"{case_name(case)}: command service {service.get('name')} requires command list")
+    return [expand_text(item, env) for item in raw_command]
 
 
 def command_to_shell(command: list[str]) -> str:
@@ -694,6 +784,16 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
     level = get_path(case, "metadata.level")
     if level not in ALLOWED_LEVELS:
         errors.append(f"{label}: metadata.level must be one of {sorted(ALLOWED_LEVELS)}")
+    metadata_levels = case.get("metadata", {}).get("levels")
+    if metadata_levels is not None:
+        if isinstance(metadata_levels, str):
+            metadata_levels = [metadata_levels]
+        if not isinstance(metadata_levels, list):
+            errors.append(f"{label}: metadata.levels must be a string or list of strings")
+        else:
+            invalid_levels = [item for item in metadata_levels if item not in ALLOWED_LEVELS]
+            if invalid_levels:
+                errors.append(f"{label}: metadata.levels contains invalid level(s): {invalid_levels}")
 
     if get_path(case, "runtime.workdir") != CONTAINER_WORKSPACE:
         errors.append(f"{label}: runtime.workdir must be {CONTAINER_WORKSPACE}")
@@ -769,7 +869,27 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
         except (TypeError, ValueError):
             errors.append(f"{label}: service {name} port must be an integer")
 
-        if service.get("type") == "vllm-serve":
+        service_type = str(service.get("type") or "")
+        if service_type not in ALLOWED_SERVICE_TYPES:
+            errors.append(f"{label}: service {name} type must be one of {sorted(ALLOWED_SERVICE_TYPES)}")
+            continue
+        try:
+            extra_port_count = service_extra_port_count(service)
+            configured_extra_ports = service_extra_ports(service)
+        except DeployCaseError as exc:
+            errors.append(f"{label}: {exc}")
+            extra_port_count = 0
+            configured_extra_ports = []
+        if configured_extra_ports:
+            if extra_port_count and len(configured_extra_ports) != extra_port_count:
+                errors.append(
+                    f"{label}: service {name} resources.extra_ports length must match resources.extra_port_count"
+                )
+            for extra_port in configured_extra_ports:
+                if not (1 <= extra_port <= 65535):
+                    errors.append(f"{label}: service {name} extra port out of range: {extra_port}")
+
+        if service_type == "vllm-serve":
             vllm = service.get("vllm")
             if not isinstance(vllm, dict):
                 errors.append(f"{label}: service {name} vllm config must be a mapping")
@@ -790,7 +910,20 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
                 else:
                     service_card_total += service_cards
         else:
-            warnings.append(f"{label}: service {name} type {service.get('type')} is reserved for future runners")
+            command = service.get("command")
+            if not isinstance(command, list) or not command:
+                errors.append(f"{label}: service {name} type command requires non-empty command list")
+            if len(services) > 1:
+                try:
+                    service_cards = service_card_count(service)
+                except DeployCaseError as exc:
+                    errors.append(f"{label}: {exc}")
+                    service_cards = None
+                if service_cards is not None:
+                    if service_cards < 0:
+                        errors.append(f"{label}: service {name} resources.card_count must be >= 0")
+                    else:
+                        service_card_total += service_cards
     if len(services) > 1:
         try:
             card_count = case_card_count(case)

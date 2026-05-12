@@ -12,9 +12,11 @@ from typing import Any
 import yaml
 from deploy_case_lib import (
     ALLOWED_LEVELS,
+    build_command_service_command,
     build_vllm_serve_command,
     case_card_count,
     case_level,
+    case_levels,
     case_name,
     command_to_shell,
     docker_config,
@@ -93,32 +95,65 @@ def _render_template(template_text: str, context: dict[str, str]) -> str:
         return rendered
 
 
+def _service_card_label(case: dict[str, Any], services: list[dict[str, Any]], service: dict[str, Any]) -> str:
+    resources = service.get("resources") or {}
+    if resources.get("card_count") is not None:
+        return str(resources["card_count"])
+    if len(services) == 1:
+        return str(case_card_count(case))
+    return "unspecified"
+
+
 def _build_context(case: dict[str, Any]) -> dict[str, str]:
     metadata = case.get("metadata", {})
     doc = case.get("doc", {})
     requirements = case.get("requirements", {})
     runtime = case.get("runtime", {})
     docker = docker_config(case)
+    services = [item for item in case.get("services", []) if isinstance(item, dict)]
     service = first_service(case)
-    vllm = service.get("vllm") or {}
-    command = build_vllm_serve_command(case, service)
-    serve_shell = command_to_shell(command)
+    first_vllm_service = next((item for item in services if item.get("type") == "vllm-serve"), service)
+    vllm = first_vllm_service.get("vllm") or {}
+    service_commands: list[tuple[dict[str, Any], list[str]]] = []
+    for item in services:
+        if item.get("type") == "vllm-serve":
+            service_commands.append((item, build_vllm_serve_command(case, item)))
+        elif item.get("type") == "command":
+            service_commands.append((item, build_command_service_command(case, item)))
+    serve_shell = "\n\n".join(
+        f"# {item.get('name')} ({item.get('role')})\n{command_to_shell(item_command)}"
+        for item, item_command in service_commands
+    )
     host = service.get("host", "127.0.0.1")
     port = service.get("port", 8000)
     readiness = case.get("checks", {}).get("readiness", {})
     readiness_path = readiness.get("path", "/health")
     benchmark = case.get("tests", {}).get("benchmark", {})
     accuracy = case.get("tests", {}).get("accuracy", {})
-    smoke_payload = json.dumps(
-        {
-            "model": served_model_name(service),
-            "prompt": "San Francisco is a",
-            "max_tokens": 8,
-            "temperature": 0,
-        },
-        indent=2,
-        ensure_ascii=False,
-    )
+    if service.get("type") == "command" or "vl" in {str(tag).lower() for tag in metadata.get("tags", [])}:
+        smoke_endpoint = "/v1/chat/completions"
+        smoke_payload = json.dumps(
+            {
+                "model": served_model_name(service),
+                "messages": [{"role": "user", "content": "Describe vLLM Ascend in one sentence."}],
+                "max_tokens": 16,
+                "temperature": 0,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    else:
+        smoke_endpoint = "/v1/completions"
+        smoke_payload = json.dumps(
+            {
+                "model": served_model_name(service),
+                "prompt": "San Francisco is a",
+                "max_tokens": 8,
+                "temperature": 0,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
 
     benchmark_command = "# benchmark disabled"
     if benchmark.get("enabled") and benchmark.get("command"):
@@ -128,11 +163,21 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
     if accuracy.get("enabled") and accuracy.get("command"):
         accuracy_command = command_to_shell([str(item) for item in accuracy["command"]])
 
-    topology = (
-        f"- Service `{service.get('name')}` runs as `{service.get('type')}` on "
-        f"`{host}:{port}` with role `{service.get('role')}`."
+    topology = "\n".join(
+        f"- Service `{item.get('name')}` runs as `{item.get('type')}` on "
+        f"`{item.get('host', '127.0.0.1')}:{item.get('port', 8000)}` "
+        f"with role `{item.get('role')}` and card_count="
+        f"`{_service_card_label(case, services, item)}`."
+        for item in services
     )
     docker_command = docker_command_example()
+
+    stop_patterns: list[str] = []
+    for _, item_command in service_commands:
+        pattern = command_to_shell(item_command[:3])
+        if pattern not in stop_patterns:
+            stop_patterns.append(pattern)
+    stop_command = "\n".join(f"pkill -f {shlex.quote(pattern)} || true" for pattern in stop_patterns)
 
     return {
         "generated_warning": str(doc.get("generated_warning", "")),
@@ -156,14 +201,14 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
         "vllm_config": yaml.safe_dump(vllm, allow_unicode=True, sort_keys=False).rstrip(),
         "readiness_command": f"curl -fsS http://{host}:{port}{readiness_path}",
         "smoke_command": (
-            f"curl -sS -X POST http://{host}:{port}/v1/completions \\\n"
+            f"curl -sS -X POST http://{host}:{port}{smoke_endpoint} \\\n"
             "  -H 'Content-Type: application/json' \\\n"
             f"  -d {shlex.quote(smoke_payload)} | python3 -m json.tool"
         ),
         "benchmark_command": benchmark_command,
         "accuracy_command": accuracy_command,
         "parameter_table": _parameter_table([str(arg) for arg in vllm.get("args", [])]),
-        "stop_command": f"pkill -f {shlex.quote(' '.join(command[:3]))} || true",
+        "stop_command": stop_command or "# no service command",
     }
 
 
@@ -172,7 +217,7 @@ def _should_render(case: dict[str, Any], level: str) -> bool:
         return True
     if level not in ALLOWED_LEVELS:
         raise ValueError(f"--level must be all or one of {sorted(ALLOWED_LEVELS)}")
-    return case_level(case) == level
+    return level in case_levels(case)
 
 
 def main() -> int:

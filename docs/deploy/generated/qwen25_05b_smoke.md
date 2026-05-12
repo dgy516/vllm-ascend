@@ -38,7 +38,7 @@ Minimal two-card single-service vLLM Ascend smoke case for Jenkins card-level co
 
 ## 4. 部署拓扑
 
-- Service `qwen25-smoke` runs as `vllm-serve` on `127.0.0.1:8000` with role `serve`.
+- Service `qwen25-smoke` runs as `vllm-serve` on `127.0.0.1:8000` with role `serve` and card_count=`2`.
 
 Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/run_runtime_container.py` 在宿主机分配并持锁；容器内 runner 再按 `requirements.hardware.card_count=2` 为本 case 分配子卡集和端口。
 
@@ -54,6 +54,7 @@ export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256
 ### vLLM 命令
 
 ```bash
+# qwen25-smoke (serve)
 vllm serve Qwen/Qwen2.5-0.5B-Instruct --served-model-name qwen25-05b-smoke --host 127.0.0.1 --port 8000 --tensor-parallel-size 2 --max-model-len 2048 --max-num-batched-tokens 2048 --trust-remote-code
 ```
 

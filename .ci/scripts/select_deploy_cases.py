@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from deploy_case_lib import ALLOWED_LEVELS, case_level, case_name, expand_case_paths, load_case
+from deploy_case_lib import ALLOWED_LEVELS, case_level, case_levels, case_name, expand_case_paths, load_case
 
 AUTO_LEVEL_BY_CI_MODE = {
     "pr": "static",
@@ -51,10 +51,11 @@ def main() -> int:
     for path in paths:
         case = load_case(path)
         level = case_level(case)
-        if args.run_all or level == selected_level:
+        levels = case_levels(case)
+        if args.run_all or selected_level in levels:
             selected.append(path)
         else:
-            skipped.append({"path": path, "case_name": case_name(case), "level": level})
+            skipped.append({"path": path, "case_name": case_name(case), "level": ",".join(sorted(levels)) or level})
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
