@@ -1,0 +1,7 @@
+---
+- name: Deploy compiled vLLM Ascend DeployCase runtime
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - role: runtime_node

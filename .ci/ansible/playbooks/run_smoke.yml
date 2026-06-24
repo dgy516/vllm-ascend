@@ -1,0 +1,26 @@
+---
+- name: Run compiled vLLM Ascend DeployCase smoke suites
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: false
+  tasks:
+    - name: Show smoke command in dry-run mode
+      ansible.builtin.debug:
+        msg: >-
+          docker exec {{ runtime_container_name }}
+          bash -lc 'cd {{ container_workspace }} &&
+          python3 .ci/scripts/ci.py smoke --case-list reports/selected_cases.txt
+          --deployment-plan reports/runtime_plan/deployment_plan.json
+          --output-dir reports/nightly/case_results --model-root {{ model_root | default('') }} --continue-on-error'
+      when: dry_run_runtime | default(true) | bool
+
+    - name: Run smoke suites inside runtime container
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          docker exec {{ runtime_container_name | quote }} bash -lc \
+            'cd {{ container_workspace }} && python3 .ci/scripts/ci.py smoke --case-list reports/selected_cases.txt --deployment-plan reports/runtime_plan/deployment_plan.json --output-dir reports/nightly/case_results --model-root {{ model_root | default("") | quote }} --continue-on-error'
+        executable: /bin/bash
+      register: runtime_smoke_run
+      changed_when: true
+      when: not (dry_run_runtime | default(true) | bool)

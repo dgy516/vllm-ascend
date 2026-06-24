@@ -16,10 +16,15 @@
 # This file is a part of the vllm-ascend project.
 #
 import functools
+import importlib.machinery
+import importlib.util
 import subprocess
 import sys
+import types
 from enum import Enum
 from unittest.mock import MagicMock
+
+import pytest
 
 try:
     # Note: do not import torch here for cpu env, which will lead to circle import error.
@@ -35,6 +40,27 @@ if not _npu_available:
         "num_vectorcore": 8,
     }
     sys.modules["triton.runtime"] = triton_runtime
+    if importlib.util.find_spec("torch_npu") is None:
+        torch_npu_module = types.ModuleType("torch_npu")
+        torch_npu_module.__spec__ = importlib.machinery.ModuleSpec("torch_npu", loader=None)
+        torch_npu_module.npu = MagicMock()
+        torch_npu_module._C = MagicMock()
+        torch_npu_inductor = types.ModuleType("torch_npu._inductor")
+        torch_npu_inductor.__spec__ = importlib.machinery.ModuleSpec("torch_npu._inductor", loader=None)
+        sys.modules["torch_npu"] = torch_npu_module
+        sys.modules["torch_npu._inductor"] = torch_npu_inductor
+        import torch
+
+        if not hasattr(torch, "npu"):
+            torch.npu = MagicMock()
+        torch.npu.current_device = MagicMock(return_value=0)
+        torch.npu.device_count = MagicMock(return_value=0)
+        torch.npu.is_available = MagicMock(return_value=False)
+    if importlib.util.find_spec("vllm_ascend._build_info") is None:
+        build_info = types.ModuleType("vllm_ascend._build_info")
+        build_info.__spec__ = importlib.machinery.ModuleSpec("vllm_ascend._build_info", loader=None)
+        build_info.__device_type__ = "A2"
+        sys.modules["vllm_ascend._build_info"] = build_info
 
 from vllm_ascend.utils import adapt_patch  # noqa E402
 from vllm_ascend.utils import register_ascend_customop  # noqa E402
@@ -49,6 +75,10 @@ adapt_patch(True)
 
 # register Ascend CustomOp here because uts will use this
 register_ascend_customop()
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "npu: unit test that requires real Ascend NPU hardware")
 
 
 class RunnerDeviceType(str, Enum):
@@ -106,6 +136,6 @@ def npu_test(num_npus: int = 1, npu_type: str | RunnerDeviceType = RunnerDeviceT
                 )
             return func(*args, **kwargs)
 
-        return wrapper
+        return pytest.mark.npu(wrapper) if npu_type != RunnerDeviceType.CPU else wrapper
 
     return decorator

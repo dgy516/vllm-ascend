@@ -1,0 +1,120 @@
+---
+- name: Validate compiled runtime host variables
+  ansible.builtin.assert:
+    that:
+      - container_workspace is defined
+      - runtime_plan_node_dir is defined
+      - runtime_plan_file is defined
+      - runtime_selected_cases_file is defined
+      - runtime_container_name is defined
+      - runtime_container_command is defined
+      - runtime_container_command | length > 0
+    fail_msg: "Compiled runtime plan is incomplete for {{ inventory_hostname }}."
+
+- name: Create runtime workspace directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ container_workspace }}"
+    - "{{ container_workspace }}/.ci"
+    - "{{ container_workspace }}/reports"
+    - "{{ container_workspace }}/logs"
+    - "{{ container_workspace }}/reports/runtime_plan"
+    - "{{ container_workspace }}/reports/runtime_plan/{{ inventory_hostname }}"
+
+- name: Copy CI runtime scripts
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../"
+    dest: "{{ container_workspace }}/.ci/"
+    mode: preserve
+
+- name: Copy compiled node plan
+  ansible.builtin.copy:
+    src: "{{ runtime_plan_node_dir }}/"
+    dest: "{{ container_workspace }}/reports/runtime_plan/{{ inventory_hostname }}/"
+    mode: preserve
+
+- name: Copy compiled deployment plan
+  ansible.builtin.copy:
+    src: "{{ runtime_plan_file }}"
+    dest: "{{ container_workspace }}/reports/runtime_plan/deployment_plan.json"
+    mode: "0644"
+
+- name: Copy selected DeployCase list
+  ansible.builtin.copy:
+    src: "{{ runtime_selected_cases_file }}"
+    dest: "{{ container_workspace }}/reports/selected_cases.txt"
+    mode: "0644"
+
+- name: Read required model paths
+  ansible.builtin.command:
+    cmd: "cat {{ container_workspace }}/reports/runtime_plan/{{ inventory_hostname }}/required_model_paths.txt"
+  register: required_model_paths
+  changed_when: false
+
+- name: Check required model paths on target node
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ required_model_paths.stdout_lines }}"
+  register: required_model_path_stats
+  when: item | length > 0
+
+- name: Fail when required model path is missing
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+    fail_msg: "Required model path is missing on {{ inventory_hostname }}: {{ item.item }}"
+  loop: "{{ required_model_path_stats.results | default([]) }}"
+  when: item.item | default('') | length > 0
+
+- name: Show compiled Docker command in dry-run mode
+  ansible.builtin.debug:
+    msg: "{{ runtime_container_command }}"
+  when: dry_run_runtime | default(true) | bool
+
+- name: Stop stale runtime container
+  ansible.builtin.shell:
+    cmd: "docker rm -f {{ runtime_container_name | quote }} >/dev/null 2>&1 || true"
+    executable: /bin/bash
+  changed_when: false
+  when: not (dry_run_runtime | default(true) | bool)
+
+- name: Start compiled runtime container in background
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      mkdir -p "{{ container_workspace }}/logs/deploy"
+      nohup {{ runtime_container_command }} > "{{ container_workspace }}/{{ runtime_container_log }}" 2>&1 &
+      echo $! > "{{ container_workspace }}/logs/deploy/{{ runtime_container_name }}.container.pid"
+    chdir: "{{ container_workspace }}"
+    executable: /bin/bash
+  changed_when: true
+  when: not (dry_run_runtime | default(true) | bool)
+
+- name: Wait for runtime container to be listed by Docker
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      docker inspect -f '{% raw %}{{.State.Running}}{% endraw %}' {{ runtime_container_name | quote }} | grep -Fx true
+    executable: /bin/bash
+  register: runtime_container_ps
+  retries: 30
+  delay: 2
+  until: runtime_container_ps.rc == 0
+  changed_when: false
+  when: not (dry_run_runtime | default(true) | bool)
+
+- name: Wait for compiled runtime readiness endpoints
+  ansible.builtin.uri:
+    url: "{{ item }}"
+    method: GET
+    status_code: 200
+    timeout: 10
+  register: runtime_readiness_probe
+  retries: 120
+  delay: 10
+  until: runtime_readiness_probe.status == 200
+  loop: "{{ runtime_readiness_urls | default([]) }}"
+  when: not (dry_run_runtime | default(true) | bool)

@@ -137,18 +137,15 @@ repo-root/
       nightly_report.html.j2
 
     scripts/
+      ci.py
+      pd_proxy.py
       run_precheck.sh
-      validate_deploy_case.py
-      render_deploy_docs.py
-      select_deploy_cases.py
-      static_validate_cases.py
-      run_runtime_container.py
-      run_deploy_cases.py
-      generate_junit_report.py
-      generate_nightly_report.py
-      compare_benchmark.py
-      collect_env.py
       cleanup_processes.sh
+
+    ci_lib/
+      ci_tool/
+        deploy_case_lib.py
+        # Internal modules; do not call these directly from Jenkins.
 
     test_suites/
       smoke/
@@ -279,14 +276,19 @@ ASCEND_LOCK_LABEL=ascend-runtime
 
 ### 6.1 资源锁
 
-第一版采用“单 runtime 容器 + 容器内卡级调度”作为默认资源模型：
+多节点和 PD runtime 已收敛到 Ansible inventory 路径，权威设计见
+`docs/ci/jenkins_ansible_deploycase_runtime_design.md`。旧的“Jenkins-managed cluster
+dry-run”只作为过渡说明保留，不再作为后续实现方向。
 
-1. 一个 Jenkins runtime build 在目标 Ascend 节点上只启动一个 Docker 容器。
-2. Jenkins 只调用一次 `.ci/scripts/run_runtime_container.py`。
-3. `.ci/scripts/run_runtime_container.py` 在宿主机用 file lock 为整个容器分配卡池和端口池，并在容器生命周期内持锁。
-4. 容器内 `.ci/scripts/run_deploy_cases.py` 根据 `requirements.hardware.card_count` 为每个 case 分配子卡集和端口。
-5. A2/A3 都不在同一节点上启动多个 Ascend workload 容器；多个 case 在同一个容器内并发。
-6. 8/16 卡大模型 case 会等待足够卡，失败后写入 JSON/JUnit/HTML 报告并继续汇总其他 case。
+当前资源模型：
+
+1. Jenkins 通过 Lockable Resources 一次性锁定 runtime 所需 Ascend 节点。
+2. `.ci/scripts/ci.py lock-inventory` 将锁到的节点转换为 cluster JSON 和 Ansible inventory。
+3. `.ci/scripts/ci.py compile-plan` 根据 DeployCase/profile、节点卡数和 Jenkins 参数编译物理部署计划。
+4. `.ci/ansible/playbooks/deploy_cases.yml` 只消费编译结果，不重新推导 DP/TP/EP 或 P/D endpoint。
+5. 每台物理机器最多启动一个 Docker 容器。
+6. 一个容器内可以启动多个 vLLM 实例进程，每个实例必须使用独立 `ASCEND_RT_VISIBLE_DEVICES` 和端口。
+7. 约束不满足时直接失败，不通过 fallback 隐藏错误。
 
 如果 Jenkins 节点 executor 大于 1，建议配置 `ASCEND_LOCK_LABEL` 做整机外层保护，避免同一节点同时启动两个 runtime 容器。
 
@@ -309,13 +311,92 @@ ASCEND_LOCK_LABEL=ascend-runtime
 
 ```groovy
 lock(label: 'ascend-maintenance', quantity: 1) {
-    sh 'python3 .ci/scripts/run_runtime_container.py ...'
+    sh 'python3 .ci/scripts/ci.py lock-inventory ...'
+    sh 'python3 .ci/scripts/ci.py compile-plan ...'
+    sh 'ANSIBLE_CONFIG=.ci/ansible/ansible.cfg ansible-playbook -i reports/runtime_plan/ansible_inventory.yml .ci/ansible/playbooks/deploy_cases.yml'
 }
 ```
 
-### 6.2 Docker 单容器运行约定
+### 6.2 Jenkins 分配多节点资源
 
-Docker runtime 由 `.ci/scripts/run_runtime_container.py` 在 Ascend agent 上启动，容器参数参考 `docs/source/tutorials/models/Qwen3-30B-A3B.md`。基础 device 和 driver mount 由脚本生成，`ASCEND_DOCKER_DEVICE_ARGS` 只保留给站点追加额外参数；该参数允许为空，空字符串表示不追加任何额外 Docker 参数。
+多节点 PD 或跨节点 Decode 不使用手工维护的节点列表作为默认方案。推荐让 Jenkins 通过
+Lockable Resources Plugin 原子分配一组 Ascend 节点：
+
+```groovy
+lock(label: 'ascend && a3 && vllm-runtime',
+     quantity: 2,
+     variable: 'LOCKED_ASCEND_NODES') {
+    echo env.LOCKED_ASCEND_NODES
+}
+```
+
+Lockable resource 的 `name` 建议与 Jenkins node name 保持一致。每个 resource 需要配置：
+
+| 属性 | 用途 |
+| --- | --- |
+| `IP` | 分布式通信和 logical service endpoint 使用的节点 IP |
+| `ANSIBLE_HOST` | 可选。Jenkins controller/Ansible 可 SSH 的地址；不配置时默认使用 `IP` |
+| `CARDS` | 该节点可用于 runtime 的 NPU 卡数，例如 `8` 或 `16` |
+| `NETWORK_INTERFACE` | Layerwise PD 通信用网卡，例如 `enp23s0f3`；也兼容 `NIC`、`IFNAME`、`NETWORK_CARD_NAME` |
+
+Jenkins lock step 会把锁到的资源写入环境变量：
+
+```text
+LOCKED_ASCEND_NODES=a3-node-01,a3-node-02
+LOCKED_ASCEND_NODES0=a3-node-01
+LOCKED_ASCEND_NODES0_PROP_IP=10.0.0.11
+LOCKED_ASCEND_NODES0_PROP_ANSIBLE_HOST=a3-node-01
+LOCKED_ASCEND_NODES0_PROP_CARDS=16
+LOCKED_ASCEND_NODES0_PROP_NETWORK_INTERFACE=enp23s0f3
+LOCKED_ASCEND_NODES1=a3-node-02
+LOCKED_ASCEND_NODES1_PROP_IP=10.0.0.12
+LOCKED_ASCEND_NODES1_PROP_ANSIBLE_HOST=a3-node-02
+LOCKED_ASCEND_NODES1_PROP_CARDS=16
+LOCKED_ASCEND_NODES1_PROP_NETWORK_INTERFACE=enp23s0f3
+```
+
+`.ci/scripts/ci.py lock-inventory` 会把这些变量转换为标准 cluster JSON 和 Ansible inventory：
+
+```json
+{
+  "allocation": "jenkins-lockable",
+  "node_count": 2,
+  "nodes": [
+    {
+      "name": "a3-node-01",
+      "jenkins_node": "a3-node-01",
+      "ip": "10.0.0.11",
+      "ansible_host": "a3-node-01",
+      "cards": 16,
+      "network_interface": "enp23s0f3"
+    },
+    {
+      "name": "a3-node-02",
+      "jenkins_node": "a3-node-02",
+      "ip": "10.0.0.12",
+      "ansible_host": "a3-node-02",
+      "cards": 16,
+      "network_interface": "enp23s0f3"
+    }
+  ]
+}
+```
+
+Jenkinsfile 通过 `RUNTIME_NODE_COUNT` 控制锁定节点数量。无论 `RUNTIME_NODE_COUNT=1`
+还是大于 1，都走同一套 Ansible runtime：
+
+1. 锁定 `ASCEND_LOCK_LABEL` 对应的 `RUNTIME_NODE_COUNT` 个资源。
+2. 生成 `reports/runtime_plan/runtime_cluster_nodes.json`。
+3. 编译 `reports/runtime_plan/deployment_plan.json` 和
+   `reports/runtime_plan/ansible_inventory.yml`。
+4. 执行 `.ci/ansible/playbooks/deploy_cases.yml`。
+
+### 6.3 Docker 单容器运行约定
+
+Docker runtime 命令由 `.ci/scripts/ci.py compile-plan` 生成，并写入
+`reports/runtime_plan/deployment_plan.json` 的 `container.command_shell` 字段。容器参数参考
+`docs/source/tutorials/models/Qwen3-30B-A3B.md`。基础 device 和 driver mount 由编译器生成，
+`ASCEND_DOCKER_DEVICE_ARGS` 只保留给站点追加额外参数；该参数允许为空，空字符串表示不追加任何额外 Docker 参数。
 
 容器启动约定：
 
@@ -335,33 +416,106 @@ docker run --rm \
   -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
   -v /etc/ascend_install.info:/etc/ascend_install.info \
   -v /root/.cache:/root/.cache \
-  -e ASCEND_RT_VISIBLE_DEVICES \
-  -e VLLM_CI_ALLOCATED_PORTS \
-  -e MODEL_ROOT=${MODEL_ROOT} \
   -v ${WORKSPACE}/.ci:/home/ma-user/AscendCloud/jenkins/.ci:ro \
   -v ${WORKSPACE}/reports:/home/ma-user/AscendCloud/jenkins/reports:rw \
   -v ${WORKSPACE}/logs:/home/ma-user/AscendCloud/jenkins/logs:rw \
   -v ${MODEL_ROOT}:${MODEL_ROOT}:ro \
   -w /home/ma-user/AscendCloud/jenkins \
   ${ASCEND_DOCKER_IMAGE} \
-  bash -lc 'cd /home/ma-user/AscendCloud/jenkins && python3 .ci/scripts/run_deploy_cases.py --parallelism ${RUNTIME_PARALLELISM} ...'
+  bash -lc 'bash /home/ma-user/AscendCloud/jenkins/reports/runtime_plan/${NODE_NAME}/start_instances.sh'
 ```
 
 如果站点需要额外 Docker 参数，可以通过 Jenkins 参数 `ASCEND_DOCKER_DEVICE_ARGS` 注入，例如 `--ulimit memlock=-1:-1`。为空时不会在 `docker run` 中追加占位参数。
 
-`DRY_RUN_RUNTIME=true` 时 Jenkins 仍会规划 runtime、执行分配 dry-run 并通过 `run_runtime_container.py --dry-run --print-command` 打印单个 Docker 命令，但不会启动真实容器或模型。
+`DRY_RUN_RUNTIME=true` 时 Jenkins 仍会锁定资源、生成 Ansible inventory、编译 deployment plan 并以
+Ansible check mode 打印每个节点的 Docker 命令，但不会启动真实容器或模型。
 
-### 6.3 PD 多服务运行约定
+### 6.4 PD 多服务运行约定
 
-PD 分离不再按“一个服务一个 Jenkins task”拆分。一个 DeployCase 表达一个完整拓扑，runner 在同一个 Docker 容器内启动多个进程：
+PD 分离不再按“一个服务一个 Jenkins task”拆分。一个 DeployCase/profile 表达一个完整拓扑，编译器把 logical service 转换为容器内多个进程：
 
 - `type: vllm-serve`：启动真实 vLLM worker，例如 prefill、decode、prefill-decode。
 - `type: command`：启动 proxy/router 等控制面进程，例如 `.ci/scripts/pd_proxy.py`。
-- `services[].resources.card_count` 表达单个服务需要的卡数；proxy 可以设置为 `0`。
-- `services[].resources.extra_port_count` 表达 KV transfer 等附加端口需求；runner 会和 HTTP 服务端口一起分配，避免并发 case 冲突。
+- `profile.services.<role>.parallel` 表达 DP/TP/EP；`required_cards = dp * tp`。
+- `profile.services.<role>.extra_port_count` 表达 KV transfer 等附加端口需求；编译器会和 HTTP 服务端口一起分配，避免冲突。
 - `metadata.levels` 可让同一个复杂 case 同时进入 `static` 和 `smoke` 选择，避免维护两份重复 YAML。
+- 编译器会为 proxy 注入模型无关的 `PREFILL_SERVERS`、`DECODE_SERVERS`。它们的值只包含 `IP:port`，不带 `http://` 前缀；proxy 从环境变量读取 P/D backend，不通过 CLI 参数传入。DeployCase 不应依赖包含具体模型名的服务变量。
+- 使用 `MooncakeLayerwiseConnector` 时，编译器会从 Lockable Resources 的 `NETWORK_INTERFACE` 生成实例级 `NETWORK_CARD_NAME`、`GLOO_SOCKET_IFNAME`、`TP_SOCKET_IFNAME`、`HCCL_SOCKET_IFNAME`，并把 `HCCL_IF_IP` 设置为当前节点 `IP`。缺少该属性时直接失败，不回退到不确定网卡。
 
-当前 Qwen2.5-VL-7B-Instruct 使用 P/D 形态作为 PR/smoke 示例：proxy 接收 OpenAI chat 请求，先请求 prefiller 获取 `kv_transfer_params`，再把原请求转发给 decoder。后续多 P 多 D 拓扑仍沿用同一个 `services[]` 模型。
+当前 Qwen2.5-VL-7B-Instruct 使用 P/D 形态作为 PR/smoke 示例：prefill 和 decode 各使用 2 张卡，顺带覆盖 TP=2 的多卡并行通信路径；proxy 接收 OpenAI chat 请求，先请求 prefiller 获取 `kv_transfer_params`，再把原请求转发给 decoder。后续多 P 多 D 拓扑仍沿用同一个 `profile.services` 模型。
+
+### 6.5 Decode 跨节点语义
+
+一个 Decode 实例可能需要两个或更多节点。此时不要把它拆成多个 Decode service；应表达为一个
+logical Decode service，包含多个 node rank：
+
+```yaml
+profile:
+  services:
+    decode:
+      replicas: 1
+      parallel:
+        dp: 2
+        tp: 8
+        ep: 1
+```
+
+语义约定：
+
+1. Decode head/rank0 暴露 HTTP endpoint。
+2. Decode worker rank 只参与分布式推理，不加入 `DECODE_SERVERS`。
+3. `DECODE_SERVERS` 只包含 logical Decode endpoint，例如 `10.0.0.11:8092`。
+4. 如果需要多个 Decode 副本，才定义多个 logical Decode service，每个 service 贡献一个 endpoint。
+5. 分布式启动方式不在 Jenkinsfile 中硬编码；编译器按 profile 和 inventory 注入
+   `--data-parallel-address`、`--data-parallel-rpc-port`、`--data-parallel-start-rank`、
+   `--data-parallel-size-local` 和实例级卡分配。
+
+### 6.6 MTP 与图模式约定
+
+支持 MTP 的模型应尽量在 Decode 侧启用 MTP，并在能通过验证的情况下打开 Decode 图模式。PD 场景下
+Prefill 不默认启用 MTP；Prefill 负责 KV 构造，默认保持更稳定的启动路径，避免扩大 Prefill 图和显存压力。
+
+推荐约定：
+
+- Qwen3.5 MTP 使用 `--speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}'`。
+- Decode 侧配合 `--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4]}'` 做 PR/smoke。
+- `[4]` 来自 `num_speculative_tokens + 1`，只捕获单请求 smoke 所需最小图，避免默认生成多档大图。
+- Nightly 或 benchmark 可以扩展为 `[4,8,12,16]` 等真实并发档位，但必须记录图显存和启动耗时。
+- 不默认给 MTP Decode 加 `--enforce-eager`；图模式失败时才能作为隔离或临时 fallback。
+
+验收时需要分开记录：
+
+- `text + MTP + FULL_DECODE_ONLY graph`
+- `VL + MTP + FULL_DECODE_ONLY graph`
+- `VL without MTP`
+
+如果 VL 请求 HTTP 200 但返回 content 为空，不能算 VL + MTP 通过。
+
+### 6.7 Function Call 与 Reasoning 约定
+
+Function call 和 reasoning parser 不做全局默认开启。它们是模型族协议，必须由 DeployCase/profile
+显式声明启动参数，避免错误 parser 改写普通响应。
+
+Qwen3.5 系列推荐在 Prefill 和 Decode service 上都开启：
+
+```text
+--reasoning-parser qwen3
+--enable-auto-tool-choice
+--tool-call-parser qwen3_xml
+```
+
+PD proxy 会先把同一 OpenAI 请求发给 Prefill。Prefill 不负责最终响应解析，但仍要通过 tool 请求校验和
+chat template 渲染，因此 P/D 两侧 parser 配置必须保持一致。
+
+Smoke suite 通过 capability 选择：
+
+- `thinking` 加载 `.ci/test_suites/smoke/thinking.csv`，要求响应包含 `reasoning_content`。
+- `tool_call` 加载 `.ci/test_suites/smoke/tool_call.csv`，要求响应包含 `tool_calls`。
+
+HTTP 200 但缺少上述结构化字段时，CI 必须判定该 capability 失败。`tool_call.csv` 会显式关闭
+`chat_template_kwargs.enable_thinking`，避免工具 JSON 被 reasoning parser 消费后无法形成 OpenAI `tool_calls`。
+对于需要验证结构化响应字段非空的 suite，可使用可选列 `response_json_non_empty_path`，支持用 `|`
+配置多个候选 JSON path，例如 `choices.0.message.reasoning_content|choices.0.message.reasoning`。
 
 ---
 
@@ -691,6 +845,7 @@ tests:
       include_common: true
       capabilities:
         - thinking
+        - tool_call
       extra_suite_files: []
 
   benchmark:
@@ -720,7 +875,7 @@ tests:
       min_score: null
 ```
 
-Smoke API 用例不再写入 DeployCase。通用用例放在 `.ci/test_suites/smoke/common.csv`，对所有模型生效；专用能力用例按 capability 拆分，例如 `.ci/test_suites/smoke/thinking.csv` 只对声明 `capabilities: [thinking]` 的 DeployCase 生效。CSV 用例支持正向和负向请求，使用 `expected_http_status` 判定是否通过。
+Smoke API 用例不再写入 DeployCase。通用用例放在 `.ci/test_suites/smoke/common.csv`，对所有模型生效；专用能力用例按 capability 拆分，例如 `.ci/test_suites/smoke/thinking.csv` 只对声明 `capabilities: [thinking]` 的 DeployCase 生效，`.ci/test_suites/smoke/tool_call.csv` 只对声明 `capabilities: [tool_call]` 的 DeployCase 生效。CSV 用例支持正向和负向请求，使用 `expected_http_status` 判定是否通过。
 
 ---
 
@@ -781,7 +936,7 @@ docs/deploy/generated/*.md
 Jenkins 中执行：
 
 ```bash
-python3 .ci/scripts/render_deploy_docs.py \
+python3 .ci/scripts/ci.py render-docs \
   --cases ".ci/deploy_cases/*.yaml" \
   --level nightly \
   --output-dir docs/deploy/generated
@@ -847,9 +1002,18 @@ Archive
 
 ---
 
-## 11. 脚本职责设计
+## 11. CI CLI 职责设计
 
-### 11.1 validate_deploy_case.py
+Jenkins 和本地人工验证只调用统一入口：
+
+```bash
+python3 .ci/scripts/ci.py <command> [args]
+```
+
+`ci_tool/` 下的 Python 文件是内部实现模块，不作为稳定对外接口。这样后续重构实现时只需要保持
+`ci.py` 的命令面稳定，Jenkinsfile 不需要跟着多个脚本文件名变化。
+
+### 11.1 ci.py validate
 
 职责：
 
@@ -876,13 +1040,13 @@ Archive
 输入：
 
 ```bash
-python3 .ci/scripts/validate_deploy_case.py \
+python3 .ci/scripts/ci.py validate \
   --cases ".ci/deploy_cases/*.yaml" \
   --level nightly \
   --output reports/validated_cases.json
 ```
 
-### 11.2 render_deploy_docs.py
+### 11.2 ci.py render-docs
 
 职责：
 
@@ -895,7 +1059,7 @@ python3 .ci/scripts/validate_deploy_case.py \
 4. 支持按 level 过滤。
     
 
-### 11.3 select_deploy_cases.py
+### 11.3 ci.py select
 
 职责：
 
@@ -908,7 +1072,7 @@ python3 .ci/scripts/validate_deploy_case.py \
 4. 输出 selected_cases.txt。
     
 
-### 11.4 static_validate_cases.py
+### 11.4 ci.py static-validate
 
 职责：
 
@@ -923,43 +1087,37 @@ python3 .ci/scripts/validate_deploy_case.py \
 5. 输出 static_validate.json。
     
 
-### 11.5 run_deploy_cases.py
+### 11.5 Ansible runtime execution scripts
 
 职责：
 
-1. 逐个读取 selected case。
+1. `ci.py smoke` 读取 selected case 和 `deployment_plan.json`。
     
-2. 在容器内按卡池和端口池并发调度 case。
+2. 对每个 case 选择 proxy/head endpoint，等待 readiness。
     
-3. 启动一个 case 内的单服务或多服务 vLLM 进程。
+3. 根据 `tests.smoke.suites` 加载 `.ci/test_suites/smoke/*.csv` 并执行正向/负向 smoke 用例。
     
-4. 等待服务 ready。
+4. `ci.py benchmark-tasks` 在 runtime container 内执行编译出的 benchmark command。
     
-5. 根据 `tests.smoke.suites` 加载 `.ci/test_suites/smoke/*.csv` 并执行正向/负向 smoke 用例。
+5. `ci.py merge-benchmark` 将远端 benchmark stage JSON 合并回 case result。
     
-6. 执行 benchmark。
+6. 所有 case result 写入 `reports/nightly/case_results/*.json`。
     
-7. 执行 accuracy。
-    
-8. 收集结果。
-    
-9. 清理服务。
-    
-10. 支持 continue-on-error。
-    
-11. 生成 case result JSON。
+7. nightly/benchmark 模式不 fail-fast，最后统一汇总报告。
 
-### 11.6 run_runtime_container.py
+### 11.6 ci.py compile-plan
 
 职责：
 
-1. 在宿主机分配容器级卡池和端口池，并在 Docker 生命周期内持锁。
-2. 写出 `reports/runtime_container_allocation.json`。
-3. 生成唯一的 Docker runtime 命令并写入 `reports/runtime_docker_command.sh`。
-4. 追加 Ascend 基础 device、driver mount、`.ci/reports/logs/MODEL_ROOT` mount。
-5. 仅当 `--extra-docker-args` 非空时追加站点额外 Docker 参数。
-6. 通过 `bash -lc` 在容器内执行 `run_deploy_cases.py`。
-7. 支持 `--dry-run` 和 `--print-command`，用于 Jenkins dry-run 和文档排障。
+1. 读取 selected DeployCase 和 Jenkins Lockable Resources 生成的 cluster inventory。
+2. 根据 DeployCase/profile 的模型、PD 拓扑和 DP/TP/EP 编译物理部署计划。
+3. 生成 `reports/runtime_plan/deployment_plan.json`。
+4. 生成 `reports/runtime_plan/ansible_inventory.yml`。
+5. 生成每个节点的 `start_instances.sh` 和实例级 env 文件。
+6. 为每个节点生成唯一 Docker runtime 命令。
+7. 追加 Ascend 基础 device、driver mount、`.ci/reports/logs/MODEL_ROOT` mount。
+8. 仅当 `--extra-docker-args` 非空时追加站点额外 Docker 参数。
+9. 直接失败不满足约束的 profile，例如空 Docker image、缺模型路径、TP 无法落到节点、卡/端口冲突。
     
 
 关键要求：
@@ -968,7 +1126,30 @@ nightly 模式不能 fail-fast。
 
 一个 case 失败后，要继续执行后续 case，最终统一汇总。
 
-### 11.7 generate_junit_report.py
+### 11.7 Ansible playbook
+
+职责：
+
+1. 使用 `.ci/ansible/playbooks/deploy_cases.yml`。
+2. 只消费编译后的 `ansible_inventory.yml` 和节点 plan。
+3. 在每个 Ascend 节点创建 `/home/ma-user/AscendCloud/jenkins`。
+4. 复制 `.ci` 和当前节点的 runtime plan。
+5. `DRY_RUN_RUNTIME=true` 时只打印 Docker 命令。
+6. `DRY_RUN_RUNTIME=false` 时执行编译器生成的 Docker 命令。
+
+Ansible 不负责重新推导 DP/TP/EP、P/D endpoint 或卡分配。
+
+### 11.8 ci.py prepare-logs
+
+职责：
+
+1. 读取 `reports/nightly/case_results/*.json` 中引用到的日志路径。
+2. 按 Jenkins 参数 `LOG_ARCHIVE_MODE` 生成有界日志副本到 `reports/logs/`。
+3. `failed-tail` 模式只保留失败 case 日志 tail，避免 PR/smoke 归档过大。
+4. `full` 模式复制完整引用日志，供 nightly/release/benchmark 使用。
+5. 写出 `reports/nightly/log_artifacts.json`，并回写 case result 中的 `artifacts.archived_server_log` / `artifacts.archived_server_logs`。
+
+### 11.8 ci.py junit
 
 职责：
 
@@ -989,7 +1170,7 @@ nightly 模式不能 fail-fast。
     - accuracy
         
 
-### 11.8 generate_nightly_report.py
+### 11.9 ci.py report
 
 职责：
 
@@ -1006,7 +1187,7 @@ nightly 模式不能 fail-fast。
 6. 生成 accuracy.csv。
     
 
-### 11.8 compare_benchmark.py
+### 11.10 ci.py compare-benchmark
 
 职责：
 
@@ -1037,11 +1218,15 @@ reports/
     benchmark.csv
     accuracy.csv
     environment.json
+    log_artifacts.json
 
     case_results/
       qwen3_32b_tp8.json
       qwen35_122b_a10b_dp4tp2ep8.json
       deepseek_v3_pd.json
+
+  logs/
+    # Jenkins artifact 中的有界日志副本，由 ci.py prepare-logs 生成
 ```
 
 ### 12.2 HTML 报告内容
@@ -1153,7 +1338,29 @@ reports/
     - throughput
         
 
-### 12.3 JUnit 设计
+### 12.3 日志归档策略
+
+运行时服务日志仍写入本地 `logs/`，便于在 Ascend 节点现场排障；Jenkins artifact 不直接归档原始 `logs/**/*`，而是归档 `.ci/scripts/ci.py prepare-logs` 生成的有界副本：
+
+```text
+reports/
+  logs/
+    deploy/
+      <case>/
+        server.log
+  nightly/
+    log_artifacts.json
+```
+
+默认策略由 `LOG_ARCHIVE_MODE=auto` 控制：
+
+- `CI_MODE=nightly` / `release` / `benchmark`：归档当前 case result 引用到的完整日志。
+- `CI_MODE=pr` / `static` / `smoke`：只归档失败 case 的日志 tail，默认每个文件保留最后 `LOG_ARCHIVE_TAIL_BYTES=5242880` 字节。
+- `LOG_ARCHIVE_MODE=none`：不归档日志，仅生成空 manifest。
+
+该策略避免把大模型长日志直接压入 Jenkins，同时保证失败 PR 有足够 tail 信息定位问题。完整原始日志只作为当前 build workspace 的临时运行产物，不作为长期 artifact 依赖。
+
+### 12.4 JUnit 设计
 
 每个 case 对应一个 testsuite。
 
@@ -1399,9 +1606,9 @@ __pycache__/
 执行：
 
 ```bash
-python3 .ci/scripts/validate_deploy_case.py --cases ".ci/deploy_cases/*.yaml"
-python3 .ci/scripts/render_deploy_docs.py --cases ".ci/deploy_cases/*.yaml"
-python3 .ci/scripts/select_deploy_cases.py --cases ".ci/deploy_cases/*.yaml"
+python3 .ci/scripts/ci.py validate --cases ".ci/deploy_cases/*.yaml"
+python3 .ci/scripts/ci.py render-docs --cases ".ci/deploy_cases/*.yaml"
+python3 .ci/scripts/ci.py select --cases ".ci/deploy_cases/*.yaml"
 ```
 
 要求：
@@ -1516,13 +1723,13 @@ python3 .ci/scripts/select_deploy_cases.py --cases ".ci/deploy_cases/*.yaml"
 
 交付：
 
-1. run_deploy_cases.py 支持单服务 vLLM
+1. `ci.py compile-plan` 支持单服务 vLLM 和 PD profile
     
-2. wait readiness
+2. Ansible role 在每节点启动一个 runtime container 并 wait readiness
     
-3. smoke request
+3. `ci.py smoke` 执行 smoke request
     
-4. 清理进程
+4. `cleanup_runtime.yml` 清理远端容器
     
 5. case result JSON
     
@@ -1535,9 +1742,9 @@ python3 .ci/scripts/select_deploy_cases.py --cases ".ci/deploy_cases/*.yaml"
 
 1. continue-on-error
     
-2. generate_junit_report.py
+2. ci.py junit
     
-3. generate_nightly_report.py
+3. ci.py report
     
 4. HTML 报告
     
@@ -1638,7 +1845,7 @@ Still waiting to schedule task
 
 规避：
 
-1. run_deploy_cases.py 使用 continue-on-error。
+1. `ci.py smoke` 使用 continue-on-error。
     
 2. 每个 case 都写独立 JSON。
     
@@ -1691,13 +1898,14 @@ nightly 生成完整报告
 当前第一版实现按最小可用闭环落地，边界如下：
 
 1. CI 内部实现位于 `.ci/`，根目录只保留 `Jenkinsfile`。
-2. 默认 `RUN_ASCEND=false`，静态和 PR 流程只做 YAML 校验、文档生成、case 选择和静态 CLI 校验。
+2. 默认 `RUN_ASCEND=false`，静态和 PR 流程会在 Ascend 节点执行全量 pytest UT、YAML 校验、文档生成、case 选择和静态 CLI 校验。
 3. Runner 支持单服务 `vllm-serve`，也支持同一容器内的多服务 `vllm-serve` + `command` 拓扑；Qwen2.5-VL-7B-Instruct P/D 是当前 PR/smoke 示例。
 4. Accuracy 只支持 `execute_only`，命令返回 0 即通过，报告中 `score=N/A`。
 5. Runtime 产物统一写入 `reports/` 和 `logs/`，两者已加入 `.gitignore`。
 6. `static`、`smoke`、`nightly` 至少各有一个 case，保证 Jenkins 默认 `CASE_LEVEL=auto` 不会选空。
 7. 如果 Jenkins 设置 `MODEL_ROOT`，runner 会优先使用 case 中的 `vllm.local_model_path`，避免误触发远程大模型下载。
 8. Jenkinsfile 通过 `stash`/`unstash` 显式传递 `reports/`、`logs/` 和生成文档，避免不同 agent/workspace 间产物丢失。
+9. PR 默认在 `ASCEND_LABEL` 节点运行全量 `tests/ut`；`tests/ut/conftest.py` 的 `npu_test` decorator 会自动加 `pytest.mark.npu`，便于必要时用 `UT_MARK_EXPR` 做临时过滤。
 
 ### Jenkins Job 配置
 
@@ -1710,25 +1918,47 @@ nightly 生成完整报告
 | `DEPLOY_CASE_GLOB` | `.ci/deploy_cases/*.yaml` | DeployCase 输入 |
 | `RUN_ASCEND` | `false` for PR, `true` for smoke/nightly | 是否启动真实 vLLM 服务 |
 | `RUN_BENCHMARK` | `false` by default | 只在 benchmark/nightly 节点上开启 |
+| `RUN_UT` | `true` | 是否运行 pytest UT |
+| `UT_TEST_PATH` | `tests/ut` | pytest UT 路径 |
+| `UT_MARK_EXPR` | 空 | pytest marker 表达式；默认空表示全量 UT，包括 NPU UT |
+| `UT_PYTEST_ARGS` | `-q` | pytest 附加参数；建议只放简单无空格参数 |
 | `MODEL_ROOT` | Jenkins agent 本地模型根目录 | 可为空，或用于本地模型镜像 |
 | `ASCEND_LABEL` | Ascend agent label | 例如 `ascend && 8card` |
-| `ASCEND_LOCK_LABEL` | Lockable Resources label | executor 大于 1 时建议配置整机锁 |
+| `ASCEND_LOCK_LABEL` | Lockable Resources label | 单节点时可做整机锁；多节点时作为 Jenkins 分配资源池 |
+| `RUNTIME_NODE_COUNT` | runtime 需要的 Ascend 节点数 | 默认 `1`；大于 `1` 时通过 Lockable Resources 一次性锁定多台节点 |
 | `ASCEND_DOCKER_IMAGE` | Ascend runtime Docker image | 为空时使用 `REGISTRY/IMAGE_TAG` 推导 |
-| `ASCEND_DOCKER_DEVICE_ARGS` | 可选额外 Docker 参数 | 可为空；基础 Ascend device/mount 已由 `run_runtime_container.py` 生成 |
-| `NPU_LOCK_DIR` | 卡级 file lock 目录 | 默认 `/tmp/vllm-ascend-ci/npu` |
-| `PORT_LOCK_DIR` | 端口 file lock 目录 | 默认 `/tmp/vllm-ascend-ci/ports` |
-| `RUNTIME_PARALLELISM` | 容器内 case 并发数 | `0` 表示 runner 自动并发 |
+| `ASCEND_DOCKER_DEVICE_ARGS` | 可选额外 Docker 参数 | 可为空；基础 Ascend device/mount 已由 `ci.py compile-plan` 生成 |
 | `DRY_RUN_RUNTIME` | Docker runtime dry-run | 默认 `true`，验证命令但不启动模型 |
+| `LOG_ARCHIVE_MODE` | 日志归档策略 | 默认 `auto`；PR/smoke 只归档失败日志 tail，nightly/release/benchmark 归档完整引用日志 |
+| `LOG_ARCHIVE_TAIL_BYTES` | tail 模式每个日志保留字节数 | 默认 `5242880` |
+
+UT stage 运行在 `ASCEND_LABEL` 节点，并复用 `ASCEND_LOCK_LABEL` 作为整机锁；该节点需要预装与当前分支匹配的 vLLM / vLLM Ascend / torch-npu Python 环境。
 
 ### 本地静态验证
 
 ```bash
-python3 .ci/scripts/validate_deploy_case.py --cases ".ci/deploy_cases/*.yaml" --output reports/validated_cases.json
-python3 .ci/scripts/select_deploy_cases.py --cases ".ci/deploy_cases/*.yaml" --level smoke --output reports/selected_cases.txt
-python3 .ci/scripts/render_deploy_docs.py --cases ".ci/deploy_cases/*.yaml" --level smoke --output-dir docs/deploy/generated
-python3 .ci/scripts/static_validate_cases.py --case-list reports/selected_cases.txt --output reports/static_validate.json
-python3 .ci/scripts/plan_deploy_shards.py --case-list reports/selected_cases.txt --output reports/runtime_shards.json
-python3 .ci/scripts/run_runtime_container.py --case-list reports/selected_cases.txt --allocation-json reports/test_allocation.json --docker-image '${ASCEND_DOCKER_IMAGE}' --container-name vllm-ascend-ci-dry-run --card-count 0 --port-count 1 --extra-docker-args "" --dry-run --print-command --continue-on-error
-python3 .ci/scripts/generate_junit_report.py --input reports/nightly/case_results --output reports/nightly/junit.xml
-python3 .ci/scripts/generate_nightly_report.py --input reports/nightly/case_results --output reports/nightly/index.html
+python3 .ci/scripts/ci.py validate --cases ".ci/deploy_cases/*.yaml" --output reports/validated_cases.json
+python3 -m pytest -q tests/ut --junitxml=reports/pytest/ut.xml
+python3 .ci/scripts/ci.py select --cases ".ci/deploy_cases/*.yaml" --level smoke --output reports/selected_cases.txt
+python3 .ci/scripts/ci.py render-docs --cases ".ci/deploy_cases/*.yaml" --level smoke --output-dir docs/deploy/generated
+python3 .ci/scripts/ci.py static-validate --case-list reports/selected_cases.txt --output reports/static_validate.json
+LOCKED_ASCEND_NODES=a2-node-01 \
+LOCKED_ASCEND_NODES0=a2-node-01 \
+LOCKED_ASCEND_NODES0_PROP_IP=10.0.0.11 \
+LOCKED_ASCEND_NODES0_PROP_CARDS=8 \
+python3 .ci/scripts/ci.py lock-inventory \
+  --variable LOCKED_ASCEND_NODES \
+  --output-json reports/runtime_plan/runtime_cluster_nodes.json \
+  --output-inventory reports/runtime_plan/locked_ansible_inventory.yml
+python3 .ci/scripts/ci.py compile-plan \
+  --case-list reports/selected_cases.txt \
+  --inventory-json reports/runtime_plan/runtime_cluster_nodes.json \
+  --output-dir reports/runtime_plan \
+  --model-root /path/to/model/root \
+  --docker-image '${ASCEND_DOCKER_IMAGE}' \
+  --extra-docker-args "" \
+  --dry-run
+python3 .ci/scripts/ci.py prepare-logs --case-results reports/nightly/case_results --logs-dir logs --output-dir reports/logs --mode failed-tail --tail-bytes 5242880
+python3 .ci/scripts/ci.py junit --input reports/nightly/case_results --output reports/nightly/junit.xml
+python3 .ci/scripts/ci.py report --input reports/nightly/case_results --output reports/nightly/index.html
 ```

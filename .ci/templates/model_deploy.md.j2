@@ -31,7 +31,9 @@
 
 {{ topology }}
 
-Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/run_runtime_container.py` 在宿主机分配并持锁；容器内 runner 再按 `requirements.hardware.card_count={{ card_count }}` 为本 case 分配子卡集和端口。
+Jenkins runtime 通过 Lockable Resources 获取 Ascend 节点，`.ci/scripts/ci.py compile-plan`
+根据 DeployCase 和节点 inventory 编译物理部署计划。每台物理节点最多启动一个 runtime Docker 容器；
+容器内可按编译结果启动多个 vLLM 实例，每个实例使用独立 `ASCEND_RT_VISIBLE_DEVICES` 和端口。
 
 ## 5. 环境变量
 
@@ -47,10 +49,10 @@ Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和�
 {{ serve_command }}
 ```
 
-### Docker runtime 示例
+### Jenkins / Ansible runtime 示例
 
 ```bash
-{{ docker_command }}
+{{ runtime_workflow }}
 ```
 
 Docker 配置：

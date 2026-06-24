@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from deploy_case_lib import (
+from ci_tool.deploy_case_lib import (
     ALLOWED_SOCS,
     CONTAINER_WORKSPACE,
     build_command_service_command,
@@ -41,7 +41,7 @@ FLOAT_FLAGS = {"--gpu-memory-utilization", "--request-rate", "--temperature", "-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Statically validate selected DeployCase files.")
-    parser.add_argument("--case-list", required=True, help="Path produced by select_deploy_cases.py")
+    parser.add_argument("--case-list", required=True, help="Path produced by 'ci.py select'")
     parser.add_argument("--output", default="reports/static_validate.json", help="JSON report path")
     parser.add_argument("--model-root", default="", help="Optional local model root")
     parser.add_argument("--check-model-path", action="store_true", help="Check local model paths when possible")

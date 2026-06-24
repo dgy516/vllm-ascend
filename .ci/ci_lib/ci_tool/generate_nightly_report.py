@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from deploy_case_lib import STATUS_FAILED, STATUS_PASSED, STATUS_SKIPPED, load_case_results, write_json
+from ci_tool.deploy_case_lib import STATUS_FAILED, STATUS_PASSED, STATUS_SKIPPED, load_case_results, write_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +62,11 @@ def _template_render(template_text: str, context: dict[str, str]) -> str:
         return rendered
 
 
+def _server_log_path(item: dict[str, Any]) -> str:
+    artifacts = item.get("artifacts") if isinstance(item.get("artifacts"), dict) else {}
+    return str(artifacts.get("archived_server_log") or artifacts.get("server_log") or "")
+
+
 def _case_rows(results: list[dict[str, Any]]) -> str:
     rows = []
     for item in results:
@@ -77,7 +82,7 @@ def _case_rows(results: list[dict[str, Any]]) -> str:
             f"<td>{html.escape(','.join(str(x) for x in item.get('allocated_ports') or []))}</td>"
             f"<td>{html.escape(str(item.get('container_name') or ''))}</td>"
             f"<td>{html.escape(str(item.get('host_node') or ''))}</td>"
-            f"<td>{html.escape(str((item.get('artifacts') or {}).get('server_log', '')))}</td>"
+            f"<td>{html.escape(_server_log_path(item))}</td>"
             "</tr>"
         )
     return "\n".join(rows)
@@ -162,7 +167,7 @@ def main() -> int:
             "allocated_ports": ",".join(str(x) for x in item.get("allocated_ports") or []),
             "container_name": item.get("container_name") or "",
             "host_node": item.get("host_node") or "",
-            "server_log": (item.get("artifacts") or {}).get("server_log", ""),
+            "server_log": _server_log_path(item),
         }
         for item in results
     ]
@@ -189,11 +194,13 @@ def main() -> int:
                 "case_name": item.get("case_name", ""),
                 "status": (item.get("benchmark") or {}).get("status", STATUS_SKIPPED),
                 "metrics": json.dumps((item.get("benchmark") or {}).get("metrics", {}), ensure_ascii=False),
+                "comparison": json.dumps((item.get("benchmark") or {}).get("comparison", {}), ensure_ascii=False),
+                "result_file": (item.get("benchmark") or {}).get("result_file", ""),
                 "log_file": (item.get("benchmark") or {}).get("log_file", ""),
             }
             for item in results
         ],
-        ["case_name", "status", "metrics", "log_file"],
+        ["case_name", "status", "metrics", "comparison", "result_file", "log_file"],
     )
     smoke_rows = []
     for item in results:
@@ -256,7 +263,7 @@ def main() -> int:
         "skipped": str(skipped),
         "case_rows": _case_rows(results),
         "smoke_rows": _smoke_rows(results),
-        "benchmark_rows": _stage_rows(results, "benchmark", ["metrics", "log_file"]),
+        "benchmark_rows": _stage_rows(results, "benchmark", ["metrics", "comparison", "result_file", "log_file"]),
         "accuracy_rows": _stage_rows(results, "accuracy", ["mode", "score"]),
         "environment_json": html.escape(json.dumps(environment, indent=2, ensure_ascii=False)),
     }

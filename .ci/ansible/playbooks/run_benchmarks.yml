@@ -1,0 +1,23 @@
+---
+- name: Run compiled vLLM Ascend DeployCase benchmarks
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: false
+  tasks:
+    - name: Show benchmark task count in dry-run mode
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} benchmark task count={{ runtime_benchmark_task_count | default(0) }}"
+      when: dry_run_runtime | default(true) | bool
+
+    - name: Run benchmark tasks inside runtime container
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          docker exec {{ runtime_container_name | quote }} bash -lc \
+            'cd {{ container_workspace }} && python3 .ci/scripts/ci.py benchmark-tasks --tasks reports/runtime_plan/{{ inventory_hostname }}/benchmark_tasks.json --output-dir reports/runtime_plan/benchmark_results'
+        executable: /bin/bash
+      register: runtime_benchmark_run
+      changed_when: true
+      when:
+        - not (dry_run_runtime | default(true) | bool)
+        - (runtime_benchmark_task_count | default(0) | int) > 0

@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from deploy_case_lib import ALLOWED_LEVELS, case_level, case_levels, case_name, expand_case_paths, load_case
+from ci_tool.deploy_case_lib import ALLOWED_LEVELS, case_level, case_levels, case_name, expand_case_paths, load_case
 
 AUTO_LEVEL_BY_CI_MODE = {
     "pr": "static",

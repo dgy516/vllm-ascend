@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from deploy_case_lib import expand_case_paths, load_case, validate_case, write_json
+from ci_tool.deploy_case_lib import expand_case_paths, load_case, validate_case, write_json
 
 
 def parse_args() -> argparse.Namespace:

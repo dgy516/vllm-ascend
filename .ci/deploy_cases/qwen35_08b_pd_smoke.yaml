@@ -1,0 +1,288 @@
+apiVersion: llm-ci/v1
+kind: DeployCase
+
+metadata:
+  name: qwen35-08b-pd-smoke
+  title: Qwen3.5 0.8B P/D Smoke Deployment
+  level: smoke
+  levels:
+    - smoke
+    - benchmark
+  owner: vllm-ascend-ci
+  description: Qwen3.5-0.8B 1P1D disaggregated deployment for PR smoke validation with MTP decode graph and tool-call checks.
+  tags:
+    - smoke
+    - benchmark
+    - pd
+    - qwen35
+    - mtp
+    - tool-call
+
+doc:
+  output: docs/deploy/generated/qwen35_08b_pd_smoke.md
+  audience: CI maintainers and vLLM Ascend deployment engineers
+  difficulty: intermediate
+  generated_warning: "本文档由 .ci/deploy_cases/*.yaml 自动生成，请不要直接手工修改。"
+
+requirements:
+  hardware:
+    accelerator: Ascend NPU
+    soc: any
+    min_cards: 2
+    card_count: 2
+    allow_parallel_on_host: true
+    memory: "Two Ascend cards are required; 32 GB or higher per card is recommended."
+  software:
+    python: ">=3.10"
+    cann: "Compatible with the checked-out vLLM Ascend branch"
+    vllm_ascend: "Installed in the runtime Docker image"
+    extra: "MooncakeLayerwiseConnector, Qwen3.5 MTP, and qwen3_xml tool parser are required."
+  model:
+    name: Qwen/Qwen3.5-0.8B
+    source: Local mirror
+    path_hint: "Set MODEL_ROOT to the directory containing Qwen3.5-0.8B."
+
+runtime:
+  image: "${REGISTRY}/vllm-ascend-ci:${IMAGE_TAG}"
+  workdir: /home/ma-user/AscendCloud/jenkins
+  env:
+    VLLM_USE_MODELSCOPE: "true"
+    PYTHONHASHSEED: "0"
+    ASCEND_CONNECT_TIMEOUT: "10000"
+    ASCEND_TRANSFER_TIMEOUT: "10000"
+    ASCEND_BUFFER_POOL: "4:8"
+    VLLM_USE_V1: "1"
+    VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: "480"
+    VLLM_ASCEND_ENABLE_NZ: "2"
+    PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
+    HCCL_OP_EXPANSION_MODE: AIV
+    HCCL_BUFFSIZE: "1536"
+    OMP_NUM_THREADS: "1"
+    OMP_PROC_BIND: "false"
+    TASK_QUEUE_ENABLE: "1"
+    VLLM_TORCH_PROFILER_WITH_STACK: "0"
+  docker:
+    enabled: true
+    image: "${ASCEND_DOCKER_IMAGE}"
+    workspace: /home/ma-user/AscendCloud/jenkins
+    network: host
+    ipc: host
+    shm_size: 1g
+    mounts:
+      - source: "${WORKSPACE}/.ci"
+        target: /home/ma-user/AscendCloud/jenkins/.ci
+        mode: ro
+      - source: "${WORKSPACE}/reports"
+        target: /home/ma-user/AscendCloud/jenkins/reports
+        mode: rw
+      - source: "${WORKSPACE}/logs"
+        target: /home/ma-user/AscendCloud/jenkins/logs
+        mode: rw
+      - source: "${MODEL_ROOT}"
+        target: "${MODEL_ROOT}"
+        mode: ro
+
+profile:
+  model:
+    name: Qwen/Qwen3.5-0.8B
+    local_path: ${MODEL_ROOT}/Qwen3.5-0.8B
+    served_model_name: qwen35-08b-pd-smoke
+    quantization: none
+  deployment:
+    mode: pd
+    topology: 1P1D
+  common:
+    host: 0.0.0.0
+    seed: 1024
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    max_num_seqs: 1
+    gpu_memory_utilization: "0.70"
+    prefix_caching: false
+  services:
+    proxy:
+      replicas: 1
+    prefill:
+      replicas: 1
+      kv_connector: MooncakeLayerwiseConnector
+      kv_role: producer
+      extra_port_count: 1
+      parallel:
+        dp: 1
+        tp: 1
+        ep: 1
+      extra_args:
+        - --distributed_executor_backend
+        - mp
+        - --enforce-eager
+        - --additional-config
+        - '{"recompute_scheduler_enable":true,"enable_cpu_binding":true}'
+        - --reasoning-parser
+        - qwen3
+        - --enable-auto-tool-choice
+        - --tool-call-parser
+        - qwen3_xml
+        - --async-scheduling
+        - --no-disable-hybrid-kv-cache-manager
+    decode:
+      replicas: 1
+      kv_connector: MooncakeLayerwiseConnector
+      kv_role: consumer
+      extra_port_count: 1
+      parallel:
+        dp: 1
+        tp: 1
+        ep: 1
+      extra_args:
+        - --distributed_executor_backend
+        - mp
+        - --additional-config
+        - '{"recompute_scheduler_enable":true,"enable_cpu_binding":true}'
+        - --compilation-config
+        - '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4]}'
+        - --speculative-config
+        - '{"method":"qwen3_5_mtp","num_speculative_tokens":3}'
+        - --reasoning-parser
+        - qwen3
+        - --enable-auto-tool-choice
+        - --tool-call-parser
+        - qwen3_xml
+        - --async-scheduling
+        - --no-disable-hybrid-kv-cache-manager
+
+services:
+  - name: qwen35-08b-proxy
+    role: proxy
+    type: command
+    host: 0.0.0.0
+    port: 8240
+    served_model_name: qwen35-08b-pd-smoke
+    resources:
+      card_count: 0
+    log_file: logs/deploy/qwen35-08b-pd-smoke/proxy.log
+    command:
+      - python3
+      - .ci/scripts/pd_proxy.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - ${VLLM_CI_PROXY_PORT}
+
+  - name: qwen35-08b-prefill
+    role: prefill
+    type: vllm-serve
+    host: 0.0.0.0
+    port: 8241
+    resources:
+      card_count: 1
+      extra_port_count: 1
+      extra_ports:
+        - 36441
+    log_file: logs/deploy/qwen35-08b-pd-smoke/prefill.log
+    vllm:
+      model: Qwen/Qwen3.5-0.8B
+      local_model_path: ${MODEL_ROOT}/Qwen3.5-0.8B
+      served_model_name: qwen35-08b-pd-smoke
+      args:
+        - --served-model-name
+        - qwen35-08b-pd-smoke
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8241"
+        - --tensor-parallel-size
+        - "1"
+        - --trust-remote-code
+        - --no-enable-prefix-caching
+        - --reasoning-parser
+        - qwen3
+        - --enable-auto-tool-choice
+        - --tool-call-parser
+        - qwen3_xml
+
+  - name: qwen35-08b-decode
+    role: decode
+    type: vllm-serve
+    host: 0.0.0.0
+    port: 8242
+    resources:
+      card_count: 1
+      extra_port_count: 1
+      extra_ports:
+        - 36442
+    log_file: logs/deploy/qwen35-08b-pd-smoke/decode.log
+    vllm:
+      model: Qwen/Qwen3.5-0.8B
+      local_model_path: ${MODEL_ROOT}/Qwen3.5-0.8B
+      served_model_name: qwen35-08b-pd-smoke
+      args:
+        - --served-model-name
+        - qwen35-08b-pd-smoke
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8242"
+        - --tensor-parallel-size
+        - "1"
+        - --trust-remote-code
+        - --no-enable-prefix-caching
+        - --compilation-config
+        - '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4]}'
+        - --speculative-config
+        - '{"method":"qwen3_5_mtp","num_speculative_tokens":3}'
+        - --reasoning-parser
+        - qwen3
+        - --enable-auto-tool-choice
+        - --tool-call-parser
+        - qwen3_xml
+
+checks:
+  readiness:
+    path: /health
+    timeout_sec: 1200
+    interval_sec: 10
+
+tests:
+  smoke:
+    enabled: true
+    suites:
+      include_common: true
+      capabilities:
+        - tool_call
+      extra_suite_files: []
+  benchmark:
+    enabled: true
+    command:
+      - vllm
+      - bench
+      - serve
+      - --model
+      - qwen35-08b-pd-smoke
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8240"
+      - --dataset-name
+      - random
+      - --random-input-len
+      - "128"
+      - --random-output-len
+      - "32"
+      - --num-prompts
+      - "16"
+      - --request-rate
+      - "1"
+      - --save-result
+      - --result-dir
+      - reports/nightly/benchmark/qwen35-08b-pd-smoke
+    timeout_sec: 1200
+    thresholds:
+      max_failed_requests: 0
+      max_ttft_regression_pct: 10
+      max_tpot_regression_pct: 10
+      max_itl_regression_pct: 10
+      max_throughput_drop_pct: 10
+  accuracy:
+    enabled: false
+    mode: execute_only
+    command: []

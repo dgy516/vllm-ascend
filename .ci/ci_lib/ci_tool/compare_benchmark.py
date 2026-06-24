@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from deploy_case_lib import read_json, write_json
+from ci_tool.deploy_case_lib import read_json, write_json
 
 METRIC_ALIASES = {
     "failed_requests": ["failed_requests", "num_failed_requests", "failed"],

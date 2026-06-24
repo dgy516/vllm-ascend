@@ -1,0 +1,298 @@
+apiVersion: llm-ci/v1
+kind: DeployCase
+
+metadata:
+  name: qwen35-35b-a3b-pd-nightly
+  title: Qwen3.5 35B A3B P/D Nightly Deployment
+  level: nightly
+  levels:
+    - nightly
+    - benchmark
+  owner: vllm-ascend-ci
+  description: Qwen3.5-35B-A3B P/D deployment with MTP decode graph, reasoning, and tool-call validation.
+  tags:
+    - nightly
+    - benchmark
+    - pd
+    - qwen35
+    - mtp
+    - reasoning
+    - tool-call
+
+doc:
+  output: docs/deploy/generated/qwen35_35b_a3b_pd_nightly.md
+  audience: vLLM Ascend deployment engineers
+  difficulty: advanced
+  generated_warning: "本文档由 .ci/deploy_cases/*.yaml 自动生成，请不要直接手工修改。"
+
+requirements:
+  hardware:
+    accelerator: Ascend NPU
+    soc: A3
+    min_cards: 16
+    card_count: 16
+    allow_parallel_on_host: false
+    memory: "A3 16-card node or two 8-card nodes with Layerwise PD network configured"
+  software:
+    python: ">=3.10"
+    cann: "Compatible with the checked-out vLLM Ascend branch"
+    vllm_ascend: "Installed in the runtime Docker image"
+    extra: "MooncakeLayerwiseConnector, Qwen3.5 MTP, reasoning parser, and qwen3_xml tool parser are required."
+  model:
+    name: Qwen/Qwen3.5-35B-A3B
+    source: Local mirror
+    path_hint: "Set MODEL_ROOT to the directory containing Qwen3.5-35B-A3B-w8a8-mtp."
+
+runtime:
+  image: "${REGISTRY}/vllm-ascend-ci:${IMAGE_TAG}"
+  workdir: /home/ma-user/AscendCloud/jenkins
+  env:
+    VLLM_USE_MODELSCOPE: "true"
+    PYTHONHASHSEED: "0"
+    ASCEND_CONNECT_TIMEOUT: "10000"
+    ASCEND_TRANSFER_TIMEOUT: "10000"
+    ASCEND_BUFFER_POOL: "4:8"
+    VLLM_USE_V1: "1"
+    VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: "480"
+    VLLM_ASCEND_ENABLE_NZ: "2"
+    PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
+    HCCL_OP_EXPANSION_MODE: AIV
+    HCCL_BUFFSIZE: "1536"
+    OMP_NUM_THREADS: "1"
+    OMP_PROC_BIND: "false"
+    TASK_QUEUE_ENABLE: "1"
+    VLLM_TORCH_PROFILER_WITH_STACK: "0"
+  docker:
+    enabled: true
+    image: "${ASCEND_DOCKER_IMAGE}"
+    workspace: /home/ma-user/AscendCloud/jenkins
+    network: host
+    ipc: host
+    shm_size: 1g
+    mounts:
+      - source: "${WORKSPACE}/.ci"
+        target: /home/ma-user/AscendCloud/jenkins/.ci
+        mode: ro
+      - source: "${WORKSPACE}/reports"
+        target: /home/ma-user/AscendCloud/jenkins/reports
+        mode: rw
+      - source: "${WORKSPACE}/logs"
+        target: /home/ma-user/AscendCloud/jenkins/logs
+        mode: rw
+      - source: "${MODEL_ROOT}"
+        target: "${MODEL_ROOT}"
+        mode: ro
+
+profile:
+  model:
+    name: Qwen/Qwen3.5-35B-A3B
+    local_path: ${MODEL_ROOT}/Qwen3.5-35B-A3B-w8a8-mtp
+    served_model_name: qwen35-35b-a3b-pd-nightly
+    quantization: ascend
+  deployment:
+    mode: pd
+    topology: 1P1D
+  common:
+    host: 0.0.0.0
+    seed: 1024
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    max_num_seqs: 1
+    gpu_memory_utilization: "0.90"
+    prefix_caching: false
+  services:
+    proxy:
+      replicas: 1
+    prefill:
+      replicas: 1
+      kv_connector: MooncakeLayerwiseConnector
+      kv_role: producer
+      extra_port_count: 1
+      parallel:
+        dp: 1
+        tp: 8
+        ep: 8
+      extra_args:
+        - --distributed_executor_backend
+        - mp
+        - --enforce-eager
+        - --additional-config
+        - '{"recompute_scheduler_enable":true,"enable_cpu_binding":true}'
+        - --reasoning-parser
+        - qwen3
+        - --enable-auto-tool-choice
+        - --tool-call-parser
+        - qwen3_xml
+        - --async-scheduling
+        - --no-disable-hybrid-kv-cache-manager
+    decode:
+      replicas: 1
+      kv_connector: MooncakeLayerwiseConnector
+      kv_role: consumer
+      extra_port_count: 1
+      parallel:
+        dp: 4
+        tp: 2
+        ep: 8
+      extra_args:
+        - --distributed_executor_backend
+        - mp
+        - --additional-config
+        - '{"recompute_scheduler_enable":true,"enable_cpu_binding":true}'
+        - --compilation-config
+        - '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4]}'
+        - --speculative-config
+        - '{"method":"qwen3_5_mtp","num_speculative_tokens":3}'
+        - --reasoning-parser
+        - qwen3
+        - --enable-auto-tool-choice
+        - --tool-call-parser
+        - qwen3_xml
+        - --async-scheduling
+        - --no-disable-hybrid-kv-cache-manager
+
+services:
+  - name: qwen35-35b-a3b-proxy
+    role: proxy
+    type: command
+    host: 0.0.0.0
+    port: 8230
+    served_model_name: qwen35-35b-a3b-pd-nightly
+    resources:
+      card_count: 0
+    log_file: logs/deploy/qwen35-35b-a3b-pd-nightly/proxy.log
+    command:
+      - python3
+      - .ci/scripts/pd_proxy.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - ${VLLM_CI_PROXY_PORT}
+
+  - name: qwen35-35b-a3b-prefill
+    role: prefill
+    type: vllm-serve
+    host: 0.0.0.0
+    port: 8231
+    resources:
+      card_count: 8
+      extra_port_count: 1
+      extra_ports:
+        - 36331
+    log_file: logs/deploy/qwen35-35b-a3b-pd-nightly/prefill.log
+    vllm:
+      model: Qwen/Qwen3.5-35B-A3B
+      local_model_path: ${MODEL_ROOT}/Qwen3.5-35B-A3B-w8a8-mtp
+      served_model_name: qwen35-35b-a3b-pd-nightly
+      args:
+        - --served-model-name
+        - qwen35-35b-a3b-pd-nightly
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8231"
+        - --tensor-parallel-size
+        - "8"
+        - --enable-expert-parallel
+        - --quantization
+        - ascend
+        - --trust-remote-code
+        - --no-enable-prefix-caching
+        - --reasoning-parser
+        - qwen3
+        - --enable-auto-tool-choice
+        - --tool-call-parser
+        - qwen3_xml
+
+  - name: qwen35-35b-a3b-decode
+    role: decode
+    type: vllm-serve
+    host: 0.0.0.0
+    port: 8232
+    resources:
+      card_count: 8
+      extra_port_count: 1
+      extra_ports:
+        - 36332
+    log_file: logs/deploy/qwen35-35b-a3b-pd-nightly/decode.log
+    vllm:
+      model: Qwen/Qwen3.5-35B-A3B
+      local_model_path: ${MODEL_ROOT}/Qwen3.5-35B-A3B-w8a8-mtp
+      served_model_name: qwen35-35b-a3b-pd-nightly
+      args:
+        - --served-model-name
+        - qwen35-35b-a3b-pd-nightly
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8232"
+        - --tensor-parallel-size
+        - "2"
+        - --data-parallel-size
+        - "4"
+        - --enable-expert-parallel
+        - --quantization
+        - ascend
+        - --trust-remote-code
+        - --no-enable-prefix-caching
+        - --compilation-config
+        - '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4]}'
+        - --speculative-config
+        - '{"method":"qwen3_5_mtp","num_speculative_tokens":3}'
+        - --reasoning-parser
+        - qwen3
+        - --enable-auto-tool-choice
+        - --tool-call-parser
+        - qwen3_xml
+
+checks:
+  readiness:
+    path: /health
+    timeout_sec: 2400
+    interval_sec: 10
+
+tests:
+  smoke:
+    enabled: true
+    suites:
+      include_common: true
+      capabilities:
+        - thinking
+        - tool_call
+      extra_suite_files: []
+  benchmark:
+    enabled: true
+    command:
+      - vllm
+      - bench
+      - serve
+      - --model
+      - qwen35-35b-a3b-pd-nightly
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8230"
+      - --dataset-name
+      - random
+      - --random-input-len
+      - "200"
+      - --random-output-len
+      - "128"
+      - --num-prompts
+      - "32"
+      - --request-rate
+      - "1"
+      - --save-result
+      - --result-dir
+      - reports/nightly/benchmark/qwen35-35b-a3b-pd-nightly
+    timeout_sec: 3600
+    thresholds:
+      max_failed_requests: 0
+      max_ttft_regression_pct: 10
+      max_tpot_regression_pct: 10
+      max_itl_regression_pct: 10
+      max_throughput_drop_pct: 10
+  accuracy:
+    enabled: false
+    mode: execute_only
+    command: []

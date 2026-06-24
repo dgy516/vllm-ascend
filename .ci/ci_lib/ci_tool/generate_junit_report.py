@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-from deploy_case_lib import STATUS_FAILED, STATUS_SKIPPED, load_case_results
+from ci_tool.deploy_case_lib import STATUS_FAILED, STATUS_SKIPPED, load_case_results
 
 STAGES = ["startup", "readiness", "smoke", "benchmark", "accuracy"]
 

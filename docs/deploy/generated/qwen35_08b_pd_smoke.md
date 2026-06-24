@@ -1,17 +1,17 @@
 本文档由 .ci/deploy_cases/*.yaml 自动生成，请不要直接手工修改。
 
-# Qwen2.5-VL 7B P/D Smoke Deployment
+# Qwen3.5 0.8B P/D Smoke Deployment
 
 ## 1. 文档概述
 
-Single-node Qwen2.5-VL-7B-Instruct prefiller/decoder disaggregated deployment for PR contract checks and smoke validation.
+Qwen3.5-0.8B 1P1D disaggregated deployment for PR smoke validation with MTP decode graph and tool-call checks.
 
-- Case: `qwen25-vl-7b-pd-smoke`
+- Case: `qwen35-08b-pd-smoke`
 - Level: `smoke`
 - Owner: `vllm-ascend-ci`
 - Audience: CI maintainers and vLLM Ascend deployment engineers
 - Difficulty: intermediate
-- Tags: static, smoke, vl, pd, pd-disaggregation, qwen
+- Tags: smoke, benchmark, pd, qwen35, mtp, tool-call
 
 ## 2. 环境要求
 
@@ -19,29 +19,29 @@ Single-node Qwen2.5-VL-7B-Instruct prefiller/decoder disaggregated deployment fo
 
 - `accelerator`: Ascend NPU
 - `soc`: any
-- `min_cards`: 4
-- `card_count`: 4
+- `min_cards`: 2
+- `card_count`: 2
 - `allow_parallel_on_host`: True
-- `memory`: 32 GB or higher per card recommended
+- `memory`: Two Ascend cards are required; 32 GB or higher per card is recommended.
 
 ### Software
 
 - `python`: >=3.10
 - `cann`: Compatible with the checked-out vLLM Ascend branch
 - `vllm_ascend`: Installed in the runtime Docker image
-- `extra`: MooncakeConnectorV1 support is required for P/D KV transfer.
+- `extra`: MooncakeLayerwiseConnector, Qwen3.5 MTP, and qwen3_xml tool parser are required.
 
 ## 3. 模型信息
 
-- `name`: Qwen/Qwen2.5-VL-7B-Instruct
-- `source`: Hugging Face or ModelScope
-- `path_hint`: Set MODEL_ROOT to a local model mirror when Jenkins agents cannot download models.
+- `name`: Qwen/Qwen3.5-0.8B
+- `source`: Local mirror
+- `path_hint`: Set MODEL_ROOT to the directory containing Qwen3.5-0.8B.
 
 ## 4. 部署拓扑
 
-- Service `qwen25-vl-proxy` runs as `command` on `0.0.0.0:8090` with role `proxy` and card_count=`0`.
-- Service `qwen25-vl-prefill` runs as `vllm-serve` on `0.0.0.0:8091` with role `prefill` and card_count=`2`.
-- Service `qwen25-vl-decode` runs as `vllm-serve` on `0.0.0.0:8092` with role `decode` and card_count=`2`.
+- Service `qwen35-08b-proxy` runs as `command` on `0.0.0.0:8240` with role `proxy` and card_count=`0`.
+- Service `qwen35-08b-prefill` runs as `vllm-serve` on `0.0.0.0:8241` with role `prefill` and card_count=`1`.
+- Service `qwen35-08b-decode` runs as `vllm-serve` on `0.0.0.0:8242` with role `decode` and card_count=`1`.
 
 Jenkins runtime 通过 Lockable Resources 获取 Ascend 节点，`.ci/scripts/ci.py compile-plan`
 根据 DeployCase 和节点 inventory 编译物理部署计划。每台物理节点最多启动一个 runtime Docker 容器；
@@ -50,19 +50,25 @@ Jenkins runtime 通过 Lockable Resources 获取 Ascend 节点，`.ci/scripts/ci
 ## 5. 环境变量
 
 ```bash
-export HOST_IP=0.0.0.0
 export VLLM_USE_MODELSCOPE=true
-export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256
-export HCCL_IF_IP=localhost
-export GLOO_SOCKET_IFNAME=eth0
-export TP_SOCKET_IFNAME=eth0
-export HCCL_SOCKET_IFNAME=eth0
+export PYTHONHASHSEED=0
+export ASCEND_CONNECT_TIMEOUT=10000
+export ASCEND_TRANSFER_TIMEOUT=10000
+export ASCEND_BUFFER_POOL=4:8
+export VLLM_USE_V1=1
+export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=480
+export VLLM_ASCEND_ENABLE_NZ=2
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_BUFFSIZE=1536
+export OMP_NUM_THREADS=1
 export OMP_PROC_BIND=false
-export OMP_NUM_THREADS=10
-export PREFILL_EXTRA_PORT_0=30000
-export DECODE_EXTRA_PORT_0=30100
-export PREFILL_SERVERS=0.0.0.0:8091
-export DECODE_SERVERS=0.0.0.0:8092
+export TASK_QUEUE_ENABLE=1
+export VLLM_TORCH_PROFILER_WITH_STACK=0
+export PREFILL_EXTRA_PORT_0=36441
+export DECODE_EXTRA_PORT_0=36442
+export PREFILL_SERVERS=0.0.0.0:8241
+export DECODE_SERVERS=0.0.0.0:8242
 ```
 
 ## 6. 启动服务命令
@@ -70,14 +76,14 @@ export DECODE_SERVERS=0.0.0.0:8092
 ### vLLM 命令
 
 ```bash
-# qwen25-vl-proxy (proxy)
-python3 .ci/scripts/pd_proxy.py --host 0.0.0.0 --port 8090
+# qwen35-08b-proxy (proxy)
+python3 .ci/scripts/pd_proxy.py --host 0.0.0.0 --port 8240
 
-# qwen25-vl-prefill (prefill)
-vllm serve Qwen/Qwen2.5-VL-7B-Instruct --served-model-name qwen25-vl-7b-pd --host 0.0.0.0 --port 8091 --no-enable-prefix-caching --tensor-parallel-size 2 --seed 1024 --max-model-len 10000 --max-num-batched-tokens 10000 --trust-remote-code --gpu-memory-utilization 0.90 --kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_port":"30000","engine_id":"0","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":2},"decode":{"dp_size":1,"tp_size":2}}}'
+# qwen35-08b-prefill (prefill)
+vllm serve Qwen/Qwen3.5-0.8B --served-model-name qwen35-08b-pd-smoke --host 0.0.0.0 --port 8241 --tensor-parallel-size 1 --trust-remote-code --no-enable-prefix-caching --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml
 
-# qwen25-vl-decode (decode)
-vllm serve Qwen/Qwen2.5-VL-7B-Instruct --served-model-name qwen25-vl-7b-pd --host 0.0.0.0 --port 8092 --no-enable-prefix-caching --tensor-parallel-size 2 --seed 1024 --max-model-len 10000 --max-num-batched-tokens 10000 --trust-remote-code --gpu-memory-utilization 0.90 --kv-transfer-config '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_consumer","kv_port":"30100","engine_id":"1","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":2},"decode":{"dp_size":1,"tp_size":2}}}'
+# qwen35-08b-decode (decode)
+vllm serve Qwen/Qwen3.5-0.8B --served-model-name qwen35-08b-pd-smoke --host 0.0.0.0 --port 8242 --tensor-parallel-size 1 --trust-remote-code --no-enable-prefix-caching --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4]}' --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}' --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_xml
 ```
 
 ### Jenkins / Ansible runtime 示例
@@ -134,43 +140,38 @@ Docker 配置：
 ## 7. vLLM config 示例
 
 ```yaml
-model: Qwen/Qwen2.5-VL-7B-Instruct
-local_model_path: ${MODEL_ROOT}/Qwen2.5-VL-7B-Instruct
-served_model_name: qwen25-vl-7b-pd
+model: Qwen/Qwen3.5-0.8B
+local_model_path: ${MODEL_ROOT}/Qwen3.5-0.8B
+served_model_name: qwen35-08b-pd-smoke
 args:
 - --served-model-name
-- qwen25-vl-7b-pd
+- qwen35-08b-pd-smoke
 - --host
-- ${HOST_IP}
+- 0.0.0.0
 - --port
-- '8091'
-- --no-enable-prefix-caching
+- '8241'
 - --tensor-parallel-size
-- '2'
-- --seed
-- '1024'
-- --max-model-len
-- '10000'
-- --max-num-batched-tokens
-- '10000'
+- '1'
 - --trust-remote-code
-- --gpu-memory-utilization
-- '0.90'
-- --kv-transfer-config
-- '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_port":"${PREFILL_EXTRA_PORT_0}","engine_id":"0","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":2},"decode":{"dp_size":1,"tp_size":2}}}'
+- --no-enable-prefix-caching
+- --reasoning-parser
+- qwen3
+- --enable-auto-tool-choice
+- --tool-call-parser
+- qwen3_xml
 ```
 
 ## 8. 服务验证
 
 ```bash
-curl -fsS http://0.0.0.0:8090/health
+curl -fsS http://0.0.0.0:8240/health
 ```
 
 ```bash
-curl -sS -X POST http://0.0.0.0:8090/v1/chat/completions \
+curl -sS -X POST http://0.0.0.0:8240/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-  "model": "qwen25-vl-7b-pd",
+  "model": "qwen35-08b-pd-smoke",
   "messages": [
     {
       "role": "user",
@@ -185,7 +186,7 @@ curl -sS -X POST http://0.0.0.0:8090/v1/chat/completions \
 ## 9. Benchmark 验证
 
 ```bash
-# benchmark disabled
+vllm bench serve --model qwen35-08b-pd-smoke --host 127.0.0.1 --port 8240 --dataset-name random --random-input-len 128 --random-output-len 32 --num-prompts 16 --request-rate 1 --save-result --result-dir reports/nightly/benchmark/qwen35-08b-pd-smoke
 ```
 
 ## 10. Accuracy 验证
@@ -198,23 +199,21 @@ curl -sS -X POST http://0.0.0.0:8090/v1/chat/completions \
 
 | Parameter | Value |
 | --- | --- |
-| `--served-model-name` | `qwen25-vl-7b-pd` |
-| `--host` | `${HOST_IP}` |
-| `--port` | `8091` |
-| `--no-enable-prefix-caching` | enabled |
-| `--tensor-parallel-size` | `2` |
-| `--seed` | `1024` |
-| `--max-model-len` | `10000` |
-| `--max-num-batched-tokens` | `10000` |
+| `--served-model-name` | `qwen35-08b-pd-smoke` |
+| `--host` | `0.0.0.0` |
+| `--port` | `8241` |
+| `--tensor-parallel-size` | `1` |
 | `--trust-remote-code` | enabled |
-| `--gpu-memory-utilization` | `0.90` |
-| `--kv-transfer-config` | `{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_port":"${PREFILL_EXTRA_PORT_0}","engine_id":"0","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":2},"decode":{"dp_size":1,"tp_size":2}}}` |
+| `--no-enable-prefix-caching` | enabled |
+| `--reasoning-parser` | `qwen3` |
+| `--enable-auto-tool-choice` | enabled |
+| `--tool-call-parser` | `qwen3_xml` |
 
 ## 12. 停止服务
 
 ```bash
 pkill -f 'python3 .ci/scripts/pd_proxy.py --host' || true
-pkill -f 'vllm serve Qwen/Qwen2.5-VL-7B-Instruct' || true
+pkill -f 'vllm serve Qwen/Qwen3.5-0.8B' || true
 ```
 
 ## 13. 注意事项

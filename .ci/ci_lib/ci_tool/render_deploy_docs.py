@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 from pathlib import Path
 from typing import Any
 
 import yaml
-from deploy_case_lib import (
+from ci_tool.deploy_case_lib import (
     ALLOWED_LEVELS,
     build_command_service_command,
     build_vllm_serve_command,
@@ -24,8 +25,9 @@ from deploy_case_lib import (
     first_service,
     load_case,
     served_model_name,
+    service_host,
+    service_template_env,
 )
-from run_runtime_container import docker_command_example
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,6 +106,33 @@ def _service_card_label(case: dict[str, Any], services: list[dict[str, Any]], se
     return "unspecified"
 
 
+def _runtime_workflow_example() -> str:
+    return "\n".join(
+        [
+            "python3 .ci/scripts/ci.py lock-inventory \\",
+            "  --variable LOCKED_ASCEND_NODES \\",
+            "  --output-json reports/runtime_plan/runtime_cluster_nodes.json \\",
+            "  --output-inventory reports/runtime_plan/locked_ansible_inventory.yml",
+            "",
+            "python3 .ci/scripts/ci.py compile-plan \\",
+            "  --case-list reports/selected_cases.txt \\",
+            "  --inventory-json reports/runtime_plan/runtime_cluster_nodes.json \\",
+            "  --output-dir reports/runtime_plan \\",
+            "  --model-root \"${MODEL_ROOT}\" \\",
+            "  --docker-image \"${ASCEND_DOCKER_IMAGE}\" \\",
+            "  --host-workspace /home/ma-user/AscendCloud/jenkins",
+            "",
+            "ANSIBLE_CONFIG=.ci/ansible/ansible.cfg ansible-playbook \\",
+            "  -i reports/runtime_plan/ansible_inventory.yml \\",
+            "  .ci/ansible/playbooks/deploy_cases.yml \\",
+            "  -e dry_run_runtime=false",
+            "",
+            "# The compiled per-node Docker command is written to:",
+            "# reports/runtime_plan/<node>/run_container.sh",
+        ]
+    )
+
+
 def _build_context(case: dict[str, Any]) -> dict[str, str]:
     metadata = case.get("metadata", {})
     doc = case.get("doc", {})
@@ -111,6 +140,16 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
     runtime = case.get("runtime", {})
     docker = docker_config(case)
     services = [item for item in case.get("services", []) if isinstance(item, dict)]
+    env_for_docs = dict(runtime.get("env") or {})
+    if any(item.get("type") == "command" for item in services):
+        env_for_docs.update(
+            {
+                key: value
+                for key, value in service_template_env(case).items()
+                if key in {"PREFILL_SERVERS", "DECODE_SERVERS"}
+                or re.match(r"^(PREFILL|DECODE)_EXTRA_PORT_[0-9]+$", key)
+            }
+        )
     service = first_service(case)
     first_vllm_service = next((item for item in services if item.get("type") == "vllm-serve"), service)
     vllm = first_vllm_service.get("vllm") or {}
@@ -124,7 +163,7 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
         f"# {item.get('name')} ({item.get('role')})\n{command_to_shell(item_command)}"
         for item, item_command in service_commands
     )
-    host = service.get("host", "127.0.0.1")
+    host = service_host(case, service)
     port = service.get("port", 8000)
     readiness = case.get("checks", {}).get("readiness", {})
     readiness_path = readiness.get("path", "/health")
@@ -165,12 +204,12 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
 
     topology = "\n".join(
         f"- Service `{item.get('name')}` runs as `{item.get('type')}` on "
-        f"`{item.get('host', '127.0.0.1')}:{item.get('port', 8000)}` "
+        f"`{service_host(case, item)}:{item.get('port', 8000)}` "
         f"with role `{item.get('role')}` and card_count="
         f"`{_service_card_label(case, services, item)}`."
         for item in services
     )
-    docker_command = docker_command_example()
+    runtime_workflow = _runtime_workflow_example()
 
     stop_patterns: list[str] = []
     for _, item_command in service_commands:
@@ -195,8 +234,8 @@ def _build_context(case: dict[str, Any]) -> dict[str, str]:
         "model_requirements": _format_mapping(requirements.get("model", {})),
         "topology": topology,
         "docker_runtime": _format_mapping(docker),
-        "docker_command": docker_command,
-        "env_exports": _env_exports(runtime.get("env") or {}),
+        "runtime_workflow": runtime_workflow,
+        "env_exports": _env_exports(env_for_docs),
         "serve_command": serve_shell,
         "vllm_config": yaml.safe_dump(vllm, allow_unicode=True, sort_keys=False).rstrip(),
         "readiness_command": f"curl -fsS http://{host}:{port}{readiness_path}",

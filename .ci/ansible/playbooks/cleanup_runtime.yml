@@ -1,0 +1,56 @@
+---
+- name: Cleanup compiled vLLM Ascend DeployCase runtime
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: false
+  tasks:
+    - name: Stop runtime container
+      ansible.builtin.shell:
+        cmd: "docker rm -f {{ runtime_container_name | quote }} >/dev/null 2>&1 || true"
+        executable: /bin/bash
+      changed_when: false
+      when: not (dry_run_runtime | default(true) | bool)
+
+    - name: Archive remote runtime artifacts
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          archive="/tmp/vllm_ascend_ci_{{ inventory_hostname }}_runtime_artifacts.tgz"
+          rm -f "${archive}"
+          cd "{{ container_workspace }}"
+          tar_paths=""
+          if [ -d logs ]; then
+            tar_paths="${tar_paths} logs"
+          fi
+          if [ -d "reports/runtime_plan" ]; then
+            tar_paths="${tar_paths} reports/runtime_plan"
+          fi
+          if [ -d "reports/nightly/benchmark" ]; then
+            tar_paths="${tar_paths} reports/nightly/benchmark"
+          fi
+          if [ -d "reports/nightly/case_results" ]; then
+            tar_paths="${tar_paths} reports/nightly/case_results"
+          fi
+          if [ -d "reports/logs" ]; then
+            tar_paths="${tar_paths} reports/logs"
+          fi
+          if [ -z "${tar_paths}" ]; then
+            mkdir -p logs
+            tar_paths="logs"
+          fi
+          tar -czf "${archive}" ${tar_paths}
+          printf '%s\n' "${archive}"
+        executable: /bin/bash
+      register: runtime_artifact_archive
+      changed_when: false
+      when: not (dry_run_runtime | default(true) | bool)
+
+    - name: Fetch remote runtime artifacts
+      ansible.builtin.fetch:
+        src: "{{ runtime_artifact_archive.stdout_lines[-1] }}"
+        dest: "{{ playbook_dir }}/../../../reports/runtime_plan/{{ inventory_hostname }}-remote-artifacts.tgz"
+        flat: true
+      when:
+        - not (dry_run_runtime | default(true) | bool)
+        - runtime_artifact_archive is defined
+        - runtime_artifact_archive.stdout_lines | default([]) | length > 0

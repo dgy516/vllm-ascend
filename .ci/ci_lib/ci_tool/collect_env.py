@@ -11,7 +11,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-from deploy_case_lib import write_json
+from ci_tool.deploy_case_lib import write_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +49,7 @@ def main() -> int:
         "ASCEND_LABEL",
         "ASCEND_LOCK_LABEL",
         "ASCEND_DOCKER_IMAGE",
-        "RUNTIME_PARALLELISM",
+        "RUNTIME_NODE_COUNT",
         "DRY_RUN_RUNTIME",
         "IMAGE_TAG",
     ]

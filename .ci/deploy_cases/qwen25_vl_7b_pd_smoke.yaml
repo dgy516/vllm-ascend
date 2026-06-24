@@ -28,8 +28,8 @@ requirements:
   hardware:
     accelerator: Ascend NPU
     soc: any
-    min_cards: 2
-    card_count: 2
+    min_cards: 4
+    card_count: 4
     allow_parallel_on_host: true
     memory: "32 GB or higher per card recommended"
   software:
@@ -46,6 +46,7 @@ runtime:
   image: "${REGISTRY}/vllm-ascend-ci:${IMAGE_TAG}"
   workdir: /home/ma-user/AscendCloud/jenkins
   env:
+    HOST_IP: "0.0.0.0"
     VLLM_USE_MODELSCOPE: "true"
     PYTORCH_NPU_ALLOC_CONF: max_split_size_mb:256
     HCCL_IF_IP: localhost
@@ -75,11 +76,47 @@ runtime:
         target: "${MODEL_ROOT}"
         mode: ro
 
+profile:
+  model:
+    name: Qwen/Qwen2.5-VL-7B-Instruct
+    local_path: ${MODEL_ROOT}/Qwen2.5-VL-7B-Instruct
+    served_model_name: qwen25-vl-7b-pd
+    quantization: none
+  deployment:
+    mode: pd
+    topology: 1P1D
+  common:
+    host: ${HOST_IP}
+    seed: 1024
+    max_model_len: 10000
+    max_num_batched_tokens: 10000
+    gpu_memory_utilization: "0.90"
+    prefix_caching: false
+  services:
+    proxy:
+      replicas: 1
+    prefill:
+      replicas: 1
+      kv_role: producer
+      extra_port_count: 1
+      parallel:
+        dp: 1
+        tp: 2
+        ep: 1
+    decode:
+      replicas: 1
+      kv_role: consumer
+      extra_port_count: 1
+      parallel:
+        dp: 1
+        tp: 2
+        ep: 1
+
 services:
   - name: qwen25-vl-proxy
     role: proxy
     type: command
-    host: 127.0.0.1
+    host: ${HOST_IP}
     port: 8090
     served_model_name: qwen25-vl-7b-pd
     resources:
@@ -89,21 +126,17 @@ services:
       - python3
       - .ci/scripts/pd_proxy.py
       - --host
-      - 127.0.0.1
+      - ${HOST_IP}
       - --port
-      - ${SERVICE_QWEN25_VL_PROXY_PORT}
-      - --prefiller-urls
-      - http://${SERVICE_QWEN25_VL_PREFILL_HOST}:${SERVICE_QWEN25_VL_PREFILL_PORT}
-      - --decoder-urls
-      - http://${SERVICE_QWEN25_VL_DECODE_HOST}:${SERVICE_QWEN25_VL_DECODE_PORT}
+      - ${VLLM_CI_PROXY_PORT}
 
   - name: qwen25-vl-prefill
     role: prefill
     type: vllm-serve
-    host: 127.0.0.1
+    host: ${HOST_IP}
     port: 8091
     resources:
-      card_count: 1
+      card_count: 2
       extra_port_count: 1
       extra_ports:
         - 30000
@@ -116,12 +149,12 @@ services:
         - --served-model-name
         - qwen25-vl-7b-pd
         - --host
-        - 127.0.0.1
+        - ${HOST_IP}
         - --port
         - "8091"
         - --no-enable-prefix-caching
         - --tensor-parallel-size
-        - "1"
+        - "2"
         - --seed
         - "1024"
         - --max-model-len
@@ -132,15 +165,15 @@ services:
         - --gpu-memory-utilization
         - "0.90"
         - --kv-transfer-config
-        - '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_port":"${SERVICE_QWEN25_VL_PREFILL_EXTRA_PORT_0}","engine_id":"0","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
+        - '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_producer","kv_port":"${PREFILL_EXTRA_PORT_0}","engine_id":"0","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":2},"decode":{"dp_size":1,"tp_size":2}}}'
 
   - name: qwen25-vl-decode
     role: decode
     type: vllm-serve
-    host: 127.0.0.1
+    host: ${HOST_IP}
     port: 8092
     resources:
-      card_count: 1
+      card_count: 2
       extra_port_count: 1
       extra_ports:
         - 30100
@@ -153,12 +186,12 @@ services:
         - --served-model-name
         - qwen25-vl-7b-pd
         - --host
-        - 127.0.0.1
+        - ${HOST_IP}
         - --port
         - "8092"
         - --no-enable-prefix-caching
         - --tensor-parallel-size
-        - "1"
+        - "2"
         - --seed
         - "1024"
         - --max-model-len
@@ -169,7 +202,7 @@ services:
         - --gpu-memory-utilization
         - "0.90"
         - --kv-transfer-config
-        - '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_consumer","kv_port":"${SERVICE_QWEN25_VL_DECODE_EXTRA_PORT_0}","engine_id":"1","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}}'
+        - '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_consumer","kv_port":"${DECODE_EXTRA_PORT_0}","engine_id":"1","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":2},"decode":{"dp_size":1,"tp_size":2}}}'
 
 checks:
   readiness:

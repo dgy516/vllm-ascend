@@ -51,7 +51,13 @@ class DeployCaseError(RuntimeError):
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / ".ci").is_dir() and (parent / "Jenkinsfile").exists():
+            return parent
+        if parent.name == ".ci" and (parent / "scripts" / "ci.py").exists():
+            return parent.parent
+    raise DeployCaseError(f"failed to resolve repository root from {current}")
 
 
 def ensure_parent(path: Path) -> None:
@@ -174,24 +180,62 @@ def runtime_env(case: dict[str, Any]) -> dict[str, str]:
     return {str(k): str(v) for k, v in env.items()}
 
 
+def service_host(case: dict[str, Any], service: dict[str, Any], default: str = "127.0.0.1") -> str:
+    return expand_text(service.get("host", default), runtime_env(case))
+
+
 def service_template_env(case: dict[str, Any], model_root: str = "") -> dict[str, str]:
     env: dict[str, str] = {}
     if model_root:
         env["MODEL_ROOT"] = model_root
+    role_urls: dict[str, list[str]] = {}
     for service in case.get("services") or []:
         if not isinstance(service, dict):
             continue
         service_name = str(service.get("name") or "")
         if not service_name:
             continue
+        host = service_host(case, service)
+        service_port = str(service.get("port", 8000))
+        endpoint = f"{host}:{service_port}"
         prefix = template_var_name(service_name)
-        env[f"SERVICE_{prefix}_HOST"] = str(service.get("host", "127.0.0.1"))
-        env[f"SERVICE_{prefix}_PORT"] = str(service.get("port", 8000))
-        for index, port in enumerate(service_extra_ports(service)):
-            env[f"SERVICE_{prefix}_EXTRA_PORT_{index}"] = str(port)
+        env[f"SERVICE_{prefix}_HOST"] = host
+        env[f"SERVICE_{prefix}_PORT"] = service_port
+        for index, extra_port in enumerate(service_extra_ports(service)):
+            env[f"SERVICE_{prefix}_EXTRA_PORT_{index}"] = str(extra_port)
         served_name = served_model_name(service)
         if served_name:
             env[f"SERVICE_{prefix}_SERVED_MODEL_NAME"] = served_name
+
+        role = str(service.get("role") or "").strip()
+        if not role:
+            continue
+        role_prefix = template_var_name(role)
+        if not role_prefix:
+            continue
+        role_index = len(role_urls.setdefault(role_prefix, []))
+        role_urls[role_prefix].append(endpoint)
+        env.setdefault(f"VLLM_CI_{role_prefix}_HOST", host)
+        env.setdefault(f"VLLM_CI_{role_prefix}_PORT", service_port)
+        env.setdefault(f"VLLM_CI_{role_prefix}_URL", endpoint)
+        env[f"VLLM_CI_{role_prefix}_{role_index}_HOST"] = host
+        env[f"VLLM_CI_{role_prefix}_{role_index}_PORT"] = service_port
+        env[f"VLLM_CI_{role_prefix}_{role_index}_URL"] = endpoint
+        env.setdefault(f"{role_prefix}_HOST", host)
+        env.setdefault(f"{role_prefix}_PORT", service_port)
+        env.setdefault(f"{role_prefix}_SERVER", endpoint)
+        env[f"{role_prefix}_{role_index}_HOST"] = host
+        env[f"{role_prefix}_{role_index}_PORT"] = service_port
+        env[f"{role_prefix}_{role_index}_SERVER"] = endpoint
+        for index, extra_port in enumerate(service_extra_ports(service)):
+            if role_index == 0:
+                env[f"VLLM_CI_{role_prefix}_EXTRA_PORT_{index}"] = str(extra_port)
+                env[f"{role_prefix}_EXTRA_PORT_{index}"] = str(extra_port)
+            env[f"VLLM_CI_{role_prefix}_{role_index}_EXTRA_PORT_{index}"] = str(extra_port)
+            env[f"{role_prefix}_{role_index}_EXTRA_PORT_{index}"] = str(extra_port)
+    for role_prefix, urls in role_urls.items():
+        env[f"VLLM_CI_{role_prefix}_URLS"] = ",".join(urls)
+        env[f"{role_prefix}_SERVERS"] = ",".join(urls)
     return env
 
 
@@ -203,6 +247,20 @@ def hardware_config(case: dict[str, Any]) -> dict[str, Any]:
 def docker_config(case: dict[str, Any]) -> dict[str, Any]:
     docker = case.get("runtime", {}).get("docker") or {}
     return docker if isinstance(docker, dict) else {}
+
+
+def cluster_config(case: dict[str, Any]) -> dict[str, Any]:
+    cluster = case.get("runtime", {}).get("cluster") or {}
+    return cluster if isinstance(cluster, dict) else {}
+
+
+def cluster_enabled(case: dict[str, Any]) -> bool:
+    return parse_bool(cluster_config(case).get("enabled"), False)
+
+
+def service_placement(service: dict[str, Any]) -> dict[str, Any]:
+    placement = service.get("placement") or {}
+    return placement if isinstance(placement, dict) else {}
 
 
 def service_card_count(service: dict[str, Any]) -> int | None:
@@ -366,7 +424,7 @@ def build_vllm_serve_command(
     args = [expand_text(arg, env) for arg in raw_args]
 
     if service.get("host") is not None:
-        set_cli_flag_value(args, "--host", service["host"])
+        set_cli_flag_value(args, "--host", service_host(case, service))
     if service.get("port") is not None:
         set_cli_flag_value(args, "--port", service["port"])
     served_name = served_model_name(service)
@@ -526,7 +584,7 @@ def _smoke_template_env(case: dict[str, Any], service: dict[str, Any], model_roo
     return {
         "served_model_name": served_model_name(service),
         "case_name": case_name(case),
-        "host": str(service.get("host", "127.0.0.1")),
+        "host": service_host(case, service),
         "port": str(service.get("port", 8000)),
         "model_root": model_root,
     }
@@ -612,6 +670,7 @@ def build_smoke_test_case(
         "min_output_tokens": min_output_tokens,
         "response_contains": _row_value(row, "response_contains", env),
         "response_not_contains": _row_value(row, "response_not_contains", env),
+        "response_json_non_empty_path": _row_value(row, "response_json_non_empty_path", env),
         "timeout_sec": timeout_sec,
         "description": _row_value(row, "description", env),
     }
@@ -631,6 +690,7 @@ def _legacy_smoke_test_case(case: dict[str, Any], service: dict[str, Any]) -> di
         "min_output_tokens": None,
         "response_contains": "",
         "response_not_contains": "",
+        "response_json_non_empty_path": "",
         "timeout_sec": int(smoke.get("timeout_sec", 120)),
         "description": "legacy inline smoke payload",
     }
@@ -735,6 +795,97 @@ def _is_non_empty(value: Any) -> bool:
     return value is not None and value != "" and value != []
 
 
+def validate_profile(case: dict[str, Any], label: str) -> tuple[list[str], list[str]]:
+    """Validate optional structured DeployCase profile v2 inputs."""
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    profile = case.get("profile")
+    if profile is None:
+        return errors, warnings
+    if not isinstance(profile, dict):
+        return [f"{label}: profile must be a mapping"], warnings
+
+    model = profile.get("model")
+    if not isinstance(model, dict):
+        errors.append(f"{label}: profile.model must be a mapping")
+        model = {}
+    for key in ("name", "served_model_name", "quantization"):
+        if not _is_non_empty(model.get(key)):
+            errors.append(f"{label}: profile.model.{key} is required")
+    if model.get("quantization") not in {"ascend", "none"}:
+        errors.append(f"{label}: profile.model.quantization must be ascend or none")
+    if "trust_remote_code" in model:
+        errors.append(f"{label}: profile.model.trust_remote_code is not configurable; compiler always enables it")
+
+    deployment = profile.get("deployment")
+    if not isinstance(deployment, dict):
+        errors.append(f"{label}: profile.deployment must be a mapping")
+        deployment = {}
+    mode = str(deployment.get("mode", "standalone"))
+    if mode not in {"standalone", "pd"}:
+        errors.append(f"{label}: profile.deployment.mode must be standalone or pd")
+
+    common = profile.get("common")
+    if common is not None and not isinstance(common, dict):
+        errors.append(f"{label}: profile.common must be a mapping when set")
+
+    services = profile.get("services")
+    if not isinstance(services, dict) or not services:
+        errors.append(f"{label}: profile.services must be a non-empty mapping")
+        return errors, warnings
+
+    if mode == "pd":
+        for role in ("prefill", "decode"):
+            if role not in services:
+                errors.append(f"{label}: profile.services.{role} is required when deployment.mode=pd")
+
+    for role, service in services.items():
+        if not isinstance(service, dict):
+            errors.append(f"{label}: profile.services.{role} must be a mapping")
+            continue
+        if "expert_parallel" in service:
+            errors.append(f"{label}: profile.services.{role}.expert_parallel is not configurable; use parallel.ep")
+        try:
+            replicas = int(service.get("replicas", 1))
+            if replicas < 1:
+                errors.append(f"{label}: profile.services.{role}.replicas must be >= 1")
+        except (TypeError, ValueError):
+            errors.append(f"{label}: profile.services.{role}.replicas must be an integer")
+
+        if role == "proxy":
+            continue
+
+        parallel = service.get("parallel")
+        if not isinstance(parallel, dict):
+            errors.append(f"{label}: profile.services.{role}.parallel must be a mapping")
+            continue
+        for key in ("dp", "tp", "ep"):
+            try:
+                value = int(parallel.get(key))
+                if value < 1:
+                    errors.append(f"{label}: profile.services.{role}.parallel.{key} must be >= 1")
+            except (TypeError, ValueError):
+                errors.append(f"{label}: profile.services.{role}.parallel.{key} must be an integer")
+
+        try:
+            extra_port_count = int(service.get("extra_port_count", 0))
+            if extra_port_count < 0:
+                errors.append(f"{label}: profile.services.{role}.extra_port_count must be >= 0")
+            if mode == "pd" and role in {"prefill", "decode"} and extra_port_count < 1:
+                errors.append(f"{label}: profile.services.{role}.extra_port_count must be >= 1 for PD")
+        except (TypeError, ValueError):
+            errors.append(f"{label}: profile.services.{role}.extra_port_count must be an integer")
+
+        extra_args = service.get("extra_args")
+        if extra_args is not None and (
+            not isinstance(extra_args, list) or any(not isinstance(item, str) for item in extra_args)
+        ):
+            errors.append(f"{label}: profile.services.{role}.extra_args must be a list of strings")
+
+    return errors, warnings
+
+
 def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -837,6 +988,23 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
         if missing_targets:
             errors.append(f"{label}: runtime.docker.mounts missing required target(s): {missing_targets}")
 
+    if cluster_enabled(case):
+        cluster = cluster_config(case)
+        mode = str(cluster.get("allocation", "jenkins-lockable"))
+        if mode != "jenkins-lockable":
+            errors.append(f"{label}: runtime.cluster.allocation must be jenkins-lockable")
+        if cluster.get("node_count") is not None:
+            try:
+                node_count = int(cluster.get("node_count"))
+                if node_count < 2:
+                    errors.append(f"{label}: runtime.cluster.node_count must be >= 2")
+            except (TypeError, ValueError):
+                errors.append(f"{label}: runtime.cluster.node_count must be an integer")
+
+    profile_errors, profile_warnings = validate_profile(case, label)
+    errors.extend(profile_errors)
+    warnings.extend(profile_warnings)
+
     services = case.get("services")
     if not isinstance(services, list) or not services:
         errors.append(f"{label}: services must be a non-empty list")
@@ -873,6 +1041,33 @@ def validate_case(case: dict[str, Any], path: str | Path | None = None) -> tuple
         if service_type not in ALLOWED_SERVICE_TYPES:
             errors.append(f"{label}: service {name} type must be one of {sorted(ALLOWED_SERVICE_TYPES)}")
             continue
+        placement = service_placement(service)
+        placement_mode = str(placement.get("mode", "single_node"))
+        if placement_mode not in {"single_node", "multi_node"}:
+            errors.append(f"{label}: service {name} placement.mode must be single_node or multi_node")
+        if placement_mode == "multi_node":
+            nodes = placement.get("nodes")
+            if nodes is not None:
+                if not isinstance(nodes, list) or len(nodes) < 2 or any(not str(item).strip() for item in nodes):
+                    errors.append(f"{label}: service {name} placement.nodes must contain at least two node names")
+            else:
+                try:
+                    node_count = int(placement.get("node_count"))
+                    if node_count < 2:
+                        errors.append(f"{label}: service {name} placement.node_count must be >= 2")
+                except (TypeError, ValueError):
+                    errors.append(f"{label}: service {name} placement.node_count is required for multi_node placement")
+            try:
+                cards_per_node = int(placement.get("cards_per_node"))
+                if cards_per_node < 1:
+                    errors.append(f"{label}: service {name} placement.cards_per_node must be >= 1")
+            except (TypeError, ValueError):
+                errors.append(f"{label}: service {name} placement.cards_per_node is required for multi_node placement")
+            endpoint = placement.get("endpoint") or {}
+            if not isinstance(endpoint, dict) or not endpoint.get("primary_node"):
+                errors.append(
+                    f"{label}: service {name} placement.endpoint.primary_node is required for multi_node placement"
+                )
         try:
             extra_port_count = service_extra_port_count(service)
             configured_extra_ports = service_extra_ports(service)

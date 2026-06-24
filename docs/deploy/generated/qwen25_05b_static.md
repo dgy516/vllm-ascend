@@ -40,7 +40,9 @@ Static Jenkins case used by PR/static flows to validate DeployCase rendering, Do
 
 - Service `qwen25-static` runs as `vllm-serve` on `127.0.0.1:8001` with role `serve` and card_count=`2`.
 
-Jenkins runtime 每次 build 只启动一个 Docker 容器。容器级卡池和端口池由 `.ci/scripts/run_runtime_container.py` 在宿主机分配并持锁；容器内 runner 再按 `requirements.hardware.card_count=2` 为本 case 分配子卡集和端口。
+Jenkins runtime 通过 Lockable Resources 获取 Ascend 节点，`.ci/scripts/ci.py compile-plan`
+根据 DeployCase 和节点 inventory 编译物理部署计划。每台物理节点最多启动一个 runtime Docker 容器；
+容器内可按编译结果启动多个 vLLM 实例，每个实例使用独立 `ASCEND_RT_VISIBLE_DEVICES` 和端口。
 
 ## 5. 环境变量
 
@@ -58,10 +60,29 @@ export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256
 vllm serve Qwen/Qwen2.5-0.5B-Instruct --served-model-name qwen25-05b-static --host 127.0.0.1 --port 8001 --tensor-parallel-size 2 --max-model-len 2048 --max-num-batched-tokens 2048 --trust-remote-code
 ```
 
-### Docker runtime 示例
+### Jenkins / Ansible runtime 示例
 
 ```bash
-docker run --rm --name 'vllm-ascend-ci-${BUILD_TAG}' --network host --ipc host --shm-size=1g --device /dev/davinci${ASCEND_CARD_ID} --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info -v /etc/ascend_install.info:/etc/ascend_install.info -v /root/.cache:/root/.cache -v '${WORKSPACE}/.ci:/home/ma-user/AscendCloud/jenkins/.ci:ro' -v '${WORKSPACE}/reports:/home/ma-user/AscendCloud/jenkins/reports:rw' -v '${WORKSPACE}/logs:/home/ma-user/AscendCloud/jenkins/logs:rw' -e 'MODEL_ROOT=${MODEL_ROOT}' -v '${MODEL_ROOT}:${MODEL_ROOT}:ro' -e ASCEND_RT_VISIBLE_DEVICES=${ASCEND_CARD_ID} -e VLLM_CI_ALLOCATED_PORTS=${VLLM_PORT} -e VLLM_CI_ALLOCATION_JSON=reports/runtime_container_allocation.json -e 'VLLM_CI_CONTAINER_NAME=vllm-ascend-ci-${BUILD_TAG}' -e PYTHONUNBUFFERED=1 -w /home/ma-user/AscendCloud/jenkins '${ASCEND_DOCKER_IMAGE}' bash -lc 'cd /home/ma-user/AscendCloud/jenkins && python3 .ci/scripts/run_deploy_cases.py --case-list reports/selected_cases.txt --allocation-json reports/runtime_container_allocation.json --output-dir reports/nightly/case_results --logs-dir logs/deploy --model-root '"'"'${MODEL_ROOT}'"'"' --parallelism '"'"'${RUNTIME_PARALLELISM}'"'"' --continue-on-error'
+python3 .ci/scripts/ci.py lock-inventory \
+  --variable LOCKED_ASCEND_NODES \
+  --output-json reports/runtime_plan/runtime_cluster_nodes.json \
+  --output-inventory reports/runtime_plan/locked_ansible_inventory.yml
+
+python3 .ci/scripts/ci.py compile-plan \
+  --case-list reports/selected_cases.txt \
+  --inventory-json reports/runtime_plan/runtime_cluster_nodes.json \
+  --output-dir reports/runtime_plan \
+  --model-root "${MODEL_ROOT}" \
+  --docker-image "${ASCEND_DOCKER_IMAGE}" \
+  --host-workspace /home/ma-user/AscendCloud/jenkins
+
+ANSIBLE_CONFIG=.ci/ansible/ansible.cfg ansible-playbook \
+  -i reports/runtime_plan/ansible_inventory.yml \
+  .ci/ansible/playbooks/deploy_cases.yml \
+  -e dry_run_runtime=false
+
+# The compiled per-node Docker command is written to:
+# reports/runtime_plan/<node>/run_container.sh
 ```
 
 Docker 配置：
